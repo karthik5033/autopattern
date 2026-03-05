@@ -4,6 +4,11 @@ const API_BASE_URL = 'http://localhost:5001';
 let workflows = [];
 let filteredWorkflows = [];
 
+// ---------- Chat State ----------
+let chatMessages = [];
+let isChatTaskRunning = false;
+let chatAbortController = null;
+
 // Helper function to refresh Lucide icons after dynamic content
 function refreshIcons() {
     if (typeof lucide !== 'undefined') {
@@ -17,6 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshIcons();
     
     initMermaid();
+    initChat();
     loadWorkflows();
     setupSearch();
 });
@@ -864,4 +870,305 @@ function escapeHtml(str) {
     const d = document.createElement('div');
     d.textContent = str;
     return d.innerHTML;
+}
+
+// ============================================================
+//  Chat Panel
+// ============================================================
+
+function initChat() {
+    const input = document.getElementById('chat-input');
+    const sendBtn = document.getElementById('chat-send-btn');
+    const clearBtn = document.getElementById('chat-clear-btn');
+
+    if (!input || !sendBtn) return;
+
+    // Send on button click
+    sendBtn.addEventListener('click', () => sendChatMessage());
+
+    // Enter to send, Shift+Enter for new line
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendChatMessage();
+        }
+    });
+
+    // Auto-resize textarea
+    input.addEventListener('input', () => {
+        input.style.height = 'auto';
+        input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    });
+
+    // Clear chat
+    clearBtn.addEventListener('click', () => {
+        if (isChatTaskRunning) return;
+        chatMessages = [];
+        saveChatHistory();
+        renderChatMessages();
+    });
+
+    // Hint chips
+    document.querySelectorAll('.chat-hint').forEach(hint => {
+        hint.addEventListener('click', () => {
+            input.value = hint.dataset.hint;
+            input.focus();
+            sendChatMessage();
+        });
+    });
+
+    // Load saved chat history
+    loadChatHistory();
+}
+
+// ---------- Chat Persistence ----------
+function saveChatHistory() {
+    try {
+        chrome.storage.local.set({ chatHistory: chatMessages });
+    } catch (e) {
+        // Fallback: ignore storage errors
+    }
+}
+
+function loadChatHistory() {
+    try {
+        chrome.storage.local.get('chatHistory', (result) => {
+            if (result.chatHistory && Array.isArray(result.chatHistory)) {
+                chatMessages = result.chatHistory;
+                renderChatMessages();
+            }
+        });
+    } catch (e) {
+        // Fallback: start with empty chat
+    }
+}
+
+// ---------- Chat Rendering ----------
+function renderChatMessages() {
+    const container = document.getElementById('chat-messages');
+    const welcome = document.getElementById('chat-welcome');
+
+    if (!container) return;
+
+    // Show/hide welcome screen
+    if (chatMessages.length === 0) {
+        container.innerHTML = '';
+        // Re-add welcome
+        const welcomeEl = document.createElement('div');
+        welcomeEl.className = 'chat-welcome';
+        welcomeEl.id = 'chat-welcome';
+        welcomeEl.innerHTML = `
+            <div class="chat-welcome-icon"><i data-lucide="bot" style="width:48px;height:48px;"></i></div>
+            <h2>What would you like to automate?</h2>
+            <p>Type a task below and AutoPattern will execute it in the browser using AI.</p>
+            <div class="chat-welcome-hints">
+                <div class="chat-hint" data-hint="Open GitHub and search for browser-use">Open GitHub and search for browser-use</div>
+                <div class="chat-hint" data-hint="Go to Google and search for AI news">Search Google for AI news</div>
+                <div class="chat-hint" data-hint="Open Twitter and scroll the feed">Open Twitter and scroll</div>
+            </div>
+        `;
+        container.appendChild(welcomeEl);
+        // Re-bind hints
+        welcomeEl.querySelectorAll('.chat-hint').forEach(hint => {
+            hint.addEventListener('click', () => {
+                document.getElementById('chat-input').value = hint.dataset.hint;
+                document.getElementById('chat-input').focus();
+                sendChatMessage();
+            });
+        });
+        refreshIcons();
+        return;
+    }
+
+    container.innerHTML = '';
+
+    chatMessages.forEach(msg => {
+        container.appendChild(createMessageElement(msg));
+    });
+
+    refreshIcons();
+    scrollChatToBottom();
+}
+
+function createMessageElement(msg) {
+    const el = document.createElement('div');
+    el.className = `chat-msg ${msg.role}`;
+
+    const avatarIcon = msg.role === 'user' ? '👤' : '⚡';
+    let bubbleClass = 'chat-msg-bubble';
+    if (msg.status === 'success') bubbleClass += ' success';
+    if (msg.status === 'error') bubbleClass += ' error';
+    if (msg.status === 'loading') bubbleClass += ' loading';
+
+    const timeStr = msg.timestamp
+        ? new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : '';
+
+    let bodyHtml = escapeHtml(msg.text);
+
+    // Render typing indicator for loading messages
+    if (msg.status === 'loading') {
+        bodyHtml = `${escapeHtml(msg.text)}<div class="chat-typing"><span></span><span></span><span></span></div>`;
+    }
+
+    el.innerHTML = `
+        <div class="chat-msg-avatar">${avatarIcon}</div>
+        <div class="chat-msg-body">
+            <div class="${bubbleClass}">${bodyHtml}</div>
+            ${timeStr ? `<div class="chat-msg-time">${timeStr}</div>` : ''}
+        </div>
+    `;
+
+    return el;
+}
+
+function appendChatMessage(role, text, status = null) {
+    const msg = {
+        role,
+        text,
+        status,
+        timestamp: Date.now()
+    };
+    chatMessages.push(msg);
+    saveChatHistory();
+
+    const container = document.getElementById('chat-messages');
+    // Remove welcome if present
+    const welcome = container.querySelector('.chat-welcome');
+    if (welcome) welcome.remove();
+
+    container.appendChild(createMessageElement(msg));
+    refreshIcons();
+    scrollChatToBottom();
+    return msg;
+}
+
+function updateLastSystemMessage(text, status = null) {
+    // Find the last system message and update it
+    for (let i = chatMessages.length - 1; i >= 0; i--) {
+        if (chatMessages[i].role === 'system') {
+            chatMessages[i].text = text;
+            chatMessages[i].status = status;
+            chatMessages[i].timestamp = Date.now();
+            saveChatHistory();
+            renderChatMessages();
+            return;
+        }
+    }
+}
+
+function scrollChatToBottom() {
+    const container = document.getElementById('chat-messages');
+    if (container) {
+        setTimeout(() => {
+            container.scrollTop = container.scrollHeight;
+        }, 50);
+    }
+}
+
+function setChatTaskStatus(status) {
+    const el = document.getElementById('chat-task-status');
+    if (!el) return;
+
+    el.className = 'chat-status';
+    switch (status) {
+        case 'running':
+            el.textContent = 'Running...';
+            el.classList.add('running');
+            break;
+        case 'error':
+            el.textContent = 'Error';
+            el.classList.add('error');
+            break;
+        case 'idle':
+        default:
+            el.textContent = 'Ready';
+            el.classList.add('idle');
+            break;
+    }
+}
+
+// ---------- Chat Send & Execute ----------
+async function sendChatMessage() {
+    const input = document.getElementById('chat-input');
+    const sendBtn = document.getElementById('chat-send-btn');
+    if (!input) return;
+
+    const text = input.value.trim();
+    if (!text || isChatTaskRunning) return;
+
+    // Add user message
+    appendChatMessage('user', text);
+
+    // Clear input
+    input.value = '';
+    input.style.height = 'auto';
+
+    // Disable input
+    isChatTaskRunning = true;
+    input.disabled = true;
+    sendBtn.disabled = true;
+    setChatTaskStatus('running');
+
+    // Add loading message
+    appendChatMessage('system', 'Starting automation task...', 'loading');
+
+    try {
+        chatAbortController = new AbortController();
+        const timeoutId = setTimeout(() => chatAbortController.abort(), 120000); // 2 min timeout
+
+        const response = await fetch(`${API_BASE_URL}/api/automate/task`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task: text }),
+            signal: chatAbortController.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.status === 503) {
+            throw new Error('Server is shutting down. Please try again later.');
+        }
+
+        if (!response.ok) {
+            const errBody = await response.json().catch(() => ({}));
+            throw new Error(errBody.detail || `Server error: ${response.status}`);
+        }
+
+        const result = await response.json();
+
+        if (result.success) {
+            updateLastSystemMessage(
+                `✅ Task completed!\n${result.task_description || ''}`,
+                'success'
+            );
+        } else {
+            updateLastSystemMessage(
+                `❌ Task failed: ${result.error || 'Unknown error'}`,
+                'error'
+            );
+        }
+
+    } catch (error) {
+        let errorMsg = error.message;
+        if (error.name === 'AbortError') {
+            errorMsg = 'Task timed out after 2 minutes.';
+        }
+        if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+            errorMsg = 'Cannot reach backend. Is the server running?';
+        }
+        updateLastSystemMessage(`❌ ${errorMsg}`, 'error');
+        setChatTaskStatus('error');
+    } finally {
+        isChatTaskRunning = false;
+        chatAbortController = null;
+        const input = document.getElementById('chat-input');
+        const sendBtn = document.getElementById('chat-send-btn');
+        if (input) input.disabled = false;
+        if (sendBtn) sendBtn.disabled = false;
+        if (input) input.focus();
+
+        // Reset status after a delay if it was an error
+        setTimeout(() => setChatTaskStatus('idle'), 3000);
+    }
 }

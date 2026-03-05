@@ -54,6 +54,12 @@ function setupNavigation() {
             if (viewName === 'settings') {
                 loadSettings();
             }
+            
+            // Focus chat input when switching to chat view
+            if (viewName === 'chat') {
+                const chatInput = document.getElementById('chat-input');
+                if (chatInput) chatInput.focus();
+            }
         });
     });
 }
