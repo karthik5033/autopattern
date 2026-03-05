@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env file from the same directory as this file
+# Load .env file from the same directory as this file.
+# Exported as `env_path` so other modules (e.g. chat.py) can write to
+# the *same* file that we read from — keeping API key persistence correct.
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 

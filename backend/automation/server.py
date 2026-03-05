@@ -5,6 +5,8 @@ Provides REST API and WebSocket endpoints for browser automation.
 """
 
 import asyncio
+import logging
+import signal
 from typing import Optional
 from contextlib import asynccontextmanager
 
@@ -16,6 +18,16 @@ from .config import config
 from .workflow_loader import WorkflowLoader, Workflow, WorkflowEvent
 from .llm_client import LLMClient
 from .automation_runner import AutomationRunner
+from .task_manager import task_manager, TaskSource, BusyError
+
+logger = logging.getLogger("autopattern.server")
+
+
+# ============================================================================
+# Shutdown flag
+# ============================================================================
+
+_shutting_down: bool = False
 
 
 # ============================================================================
@@ -82,6 +94,8 @@ class HealthResponse(BaseModel):
     """Health check response."""
     status: str = "ok"
     version: str = "0.2.0"
+    active_tasks: int = 0
+    draining: bool = False
 
 
 class SettingsModel(BaseModel):
@@ -103,10 +117,23 @@ class SettingsResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
+    """Application lifespan handler with ordered shutdown."""
+    global _shutting_down
+    logger.info("AutoPattern API server starting...")
     print("🚀 AutoPattern API server starting...")
     yield
+    # --- Ordered shutdown sequence ---
+    _shutting_down = True
     print("👋 AutoPattern API server shutting down...")
+    logger.info("Shutdown initiated — draining active tasks...")
+
+    # 1. Drain running automation tasks (wait up to 10s, then cancel)
+    await task_manager.drain(timeout=10.0)
+
+    # 2. Close any browser instances created by the runner
+    #    (chat.py manages its own browser; this covers server-only mode)
+    logger.info("Cleanup complete.")
+    print("✅ Graceful shutdown complete.")
 
 
 app = FastAPI(
@@ -133,7 +160,11 @@ app.add_middleware(
 @app.get("/api/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
-    return HealthResponse()
+    return HealthResponse(
+        status="draining" if _shutting_down else "ok",
+        active_tasks=task_manager.active_count,
+        draining=_shutting_down,
+    )
 
 
 # Available Gemini models
@@ -280,12 +311,26 @@ async def automate_workflow(request: AutomateRequest, background_tasks: Backgrou
                 # Use a safe placeholder format that browser-use understands
                 task_description = task_description.replace(placeholder, f"<secret>{key}</secret>")
         
+        # Reject new work if the server is shutting down
+        if _shutting_down:
+            raise HTTPException(status_code=503, detail="Server is shutting down")
+
         # Run automation with current settings and sensitive data
         runner = AutomationRunner(
             headless=request.headless if request.headless else runtime_settings.headless,
         )
-        
-        result = await runner.run_task(task_description, sensitive_data=sensitive_data)
+
+        # Submit through the shared task manager (rejects if busy)
+        try:
+            info = task_manager.submit(
+                runner.run_task(task_description, sensitive_data=sensitive_data),
+                description=task_description,
+                source=TaskSource.API,
+            )
+        except BusyError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+        result = await info.asyncio_task
         
         return AutomateResponse(
             success=result["success"],
@@ -294,6 +339,8 @@ async def automate_workflow(request: AutomateRequest, background_tasks: Backgrou
             error=result.get("error"),
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -306,14 +353,28 @@ async def automate_task(request: TaskRequest):
     Skips the LLM task generation step and executes the provided task directly.
     """
     try:
+        # Reject new work if the server is shutting down
+        if _shutting_down:
+            raise HTTPException(status_code=503, detail="Server is shutting down")
+
         # Use request settings with fallback to runtime settings
         use_headless = request.headless if request.headless else runtime_settings.headless
         
         runner = AutomationRunner(
             headless=use_headless,
         )
-        
-        result = await runner.run_task(request.task)
+
+        # Submit through the shared task manager (rejects if busy)
+        try:
+            info = task_manager.submit(
+                runner.run_task(request.task),
+                description=request.task,
+                source=TaskSource.API,
+            )
+        except BusyError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+        result = await info.asyncio_task
         
         return AutomateResponse(
             success=result["success"],
@@ -322,6 +383,8 @@ async def automate_task(request: TaskRequest):
             error=result.get("error"),
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -331,6 +394,31 @@ async def automate_task(request: TaskRequest):
 # ============================================================================
 
 def run_server(host: str = "0.0.0.0", port: int = 5001):
-    """Run the FastAPI server."""
+    """Run the FastAPI server with graceful shutdown on SIGINT/SIGTERM."""
     import uvicorn
-    uvicorn.run(app, host=host, port=port)
+
+    uvi_config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        timeout_graceful_shutdown=10,   # seconds to drain before force-exit
+    )
+    server = uvicorn.Server(uvi_config)
+
+    # uvicorn already handles SIGINT/SIGTERM to trigger shutdown,
+    # but we install a handler to print a user-friendly message.
+    _original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _shutdown_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        print(f"\n⏳ Received {sig_name} — shutting down gracefully...")
+        logger.info("Received %s, initiating graceful shutdown.", sig_name)
+        # Restore default so a second Ctrl-C force-kills
+        signal.signal(signal.SIGINT, _original_sigint)
+        server.should_exit = True
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+
+    server.run()

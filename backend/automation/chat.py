@@ -11,6 +11,7 @@ Usage:
 """
 
 import asyncio
+import concurrent.futures
 import os
 import signal
 import sys
@@ -18,9 +19,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
+
 from .config import config
 
 VERSION = "0.2.1"
+
+# ---------------------------------------------------------------------------
+# Rich console (shared)
+# ---------------------------------------------------------------------------
+
+_theme = Theme({
+    "info": "cyan",
+    "success": "bold green",
+    "warning": "bold yellow",
+    "error": "bold red",
+    "muted": "dim",
+    "accent": "bold magenta",
+    "prompt": "bold cyan",
+})
+console = Console(theme=_theme, highlight=False)
 
 AVAILABLE_MODELS = [
     "gemini-flash-latest",
@@ -30,39 +52,40 @@ AVAILABLE_MODELS = [
     "gemini-2.0-flash",
 ]
 
-HELP_TEXT = """
-╭─────────────────── AutoPattern Commands ───────────────────╮
-│                                                            │
-│  Just type a task to run it in the browser:                │
-│    you > Go to google.com and search for Python            │
-│                                                            │
-│  Slash commands:                                           │
-│    /help                 Show this help message            │
-│    /load <file.csv>      Load a workflow CSV file          │
-│    /model [name]         Show or change the LLM model      │
-│    /headless [on|off]    Toggle headless browser mode      │
-│    /history              Show tasks run this session       │
-│    /clear                Clear session history             │
-│    /key [key]            Show or change the API key        │
-│    /quit or /exit        Exit AutoPattern                  │
-│                                                            │
-│  While a task is running:                                  │
-│    Ctrl+C                Stop the running task             │
-│                                                            │
-│  At the prompt:                                            │
-│    Ctrl+C twice          Exit AutoPattern                  │
-│                                                            │
-╰────────────────────────────────────────────────────────────╯
-""".strip()
+def _print_help():
+    """Print styled help panel."""
+    help_text = Text()
+    help_text.append("Just type a task to run it in the browser:\n", style="bold")
+    help_text.append("  > ", style="prompt")
+    help_text.append("Go to google.com and search for Python\n\n")
+    help_text.append("Slash commands:\n", style="bold")
+    cmds = [
+        ("/help",            "Show this help message"),
+        ("/load <file.csv>", "Load a workflow CSV file"),
+        ("/model [name]",    "Show or change the LLM model"),
+        ("/headless [on|off]", "Toggle headless browser mode"),
+        ("/history",         "Show tasks run this session"),
+        ("/clear",           "Clear session history"),
+        ("/key [key]",       "Show or change the API key"),
+        ("/quit or /exit",   "Exit AutoPattern"),
+    ]
+    for cmd, desc in cmds:
+        help_text.append(f"  {cmd:<22}", style="accent")
+        help_text.append(f"{desc}\n")
+    help_text.append("\nWhile a task is running:\n", style="bold")
+    help_text.append("  Ctrl+C               ", style="accent")
+    help_text.append("Stop the running task\n")
+    help_text.append("\nAt the prompt:\n", style="bold")
+    help_text.append("  Ctrl+C twice          ", style="accent")
+    help_text.append("Exit AutoPattern")
+    console.print(Panel(help_text, title="AutoPattern Commands", border_style="cyan", padding=(1, 2)))
 
 
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 
-_browser = None          # Shared browser instance (lazy)
 _history: list[dict] = []
-_current_task: Optional[asyncio.Task] = None
 _headless: bool = config.headless
 
 
@@ -78,19 +101,19 @@ def _ensure_api_key() -> bool:
     if config.google_api_key:
         return True
 
-    print()
-    print("  GOOGLE_API_KEY is not set.")
-    print("  You need a free Gemini API key from:")
-    print("  https://aistudio.google.com/app/apikey\n")
+    console.print()
+    console.print("  [warning]GOOGLE_API_KEY is not set.[/warning]")
+    console.print("  You need a free Gemini API key from:")
+    console.print("  [link=https://aistudio.google.com/app/apikey]https://aistudio.google.com/app/apikey[/link]\n")
 
     try:
-        key = input("  Paste your API key here > ").strip()
+        key = console.input("  [prompt]Paste your API key here >[/prompt] ").strip()
     except (EOFError, KeyboardInterrupt):
-        print("\n  Aborted.")
+        console.print("\n  Aborted.")
         return False
 
     if not key:
-        print("  No key entered. Exiting.")
+        console.print("  No key entered. Exiting.")
         return False
 
     # Apply to current process
@@ -105,16 +128,21 @@ def _ensure_api_key() -> bool:
 
     if save in ("", "y", "yes"):
         _save_key_to_dotenv(key)
-        print("  Key saved to .env\n")
+        console.print("  [success]Key saved to .env[/success]\n")
     else:
-        print("  Key set for this session only.\n")
+        console.print("  Key set for this session only.\n")
 
     return True
 
 
 def _save_key_to_dotenv(key: str, path: Path | None = None):
-    """Append or update GOOGLE_API_KEY in a .env file."""
-    env_file = path or Path.cwd() / ".env"
+    """Append or update GOOGLE_API_KEY in a .env file.
+
+    Writes to the same .env that config.py reads from
+    (backend/automation/.env) so the key persists across restarts.
+    """
+    from .config import env_path as _config_env_path
+    env_file = path or _config_env_path
     lines: list[str] = []
     replaced = False
 
@@ -139,40 +167,21 @@ def _save_key_to_dotenv(key: str, path: Path | None = None):
 # ---------------------------------------------------------------------------
 
 def _print_banner(port: int):
-    print(f"""
-  AutoPattern v{VERSION}
-  AI-powered browser automation from CLI
-
-  API server : http://localhost:{port}
-  LLM model  : {config.llm_model}
-  Headless   : {_headless}
-
-  Type a task to automate, or /help for commands.
-""")
-
-
-# ---------------------------------------------------------------------------
-# Browser helpers
-# ---------------------------------------------------------------------------
-
-async def _get_browser():
-    """Lazily create and return the shared browser instance."""
-    global _browser
-    if _browser is None:
-        from browser_use import Browser
-        _browser = Browser(headless=_headless)
-    return _browser
-
-
-async def _close_browser():
-    """Close the shared browser if it exists."""
-    global _browser
-    if _browser is not None:
-        try:
-            await _browser.stop()
-        except Exception:
-            pass
-        _browser = None
+    banner = Text()
+    banner.append("⚡ AutoPattern", style="bold cyan")
+    banner.append(f" v{VERSION}\n", style="muted")
+    banner.append("AI-powered browser automation\n\n", style="italic")
+    banner.append("API server  ", style="bold")
+    banner.append(f"http://localhost:{port}\n", style="info")
+    banner.append("LLM model   ", style="bold")
+    banner.append(f"{config.llm_model}\n", style="info")
+    banner.append("Headless    ", style="bold")
+    banner.append(f"{'on' if _headless else 'off'}\n\n", style="info")
+    banner.append("Type a task to automate, or ", style="muted")
+    banner.append("/help", style="accent")
+    banner.append(" for commands.", style="muted")
+    console.print(Panel(banner, border_style="cyan", padding=(1, 2)))
+    console.print()
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +189,16 @@ async def _close_browser():
 # ---------------------------------------------------------------------------
 
 async def _run_task(task_description: str, sensitive_data: Optional[dict] = None) -> dict:
-    """Run a browser task using the shared browser instance."""
-    from .automation_runner import AutomationRunner
+    """Run a browser task with a fresh browser each time.
 
-    browser = await _get_browser()
+    browser-use resets the browser session after each Agent.run(),
+    so reusing a Browser object causes BrowserStateRequestEvent
+    failures on subsequent tasks.  We create a new Browser per task.
+    """
+    from .automation_runner import AutomationRunner
+    from browser_use import Browser
+
+    browser = Browser(headless=_headless)
     runner = AutomationRunner(
         headless=_headless,
         llm_model=config.llm_model,
@@ -196,7 +211,7 @@ async def _run_task(task_description: str, sensitive_data: Optional[dict] = None
 # ---------------------------------------------------------------------------
 
 def _cmd_help():
-    print(HELP_TEXT)
+    _print_help()
 
 
 def _cmd_model(args: str):
@@ -204,12 +219,15 @@ def _cmd_model(args: str):
     parts = args.strip().split()
     if not parts:
         # Show current model + available list
-        print(f"\n  Current model: {config.llm_model}")
-        print(f"  Available models:")
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("model", style="info")
+        table.add_column("status")
         for m in AVAILABLE_MODELS:
-            marker = " ◀" if m == config.llm_model else ""
-            print(f"    - {m}{marker}")
-        print()
+            if m == config.llm_model:
+                table.add_row(m, "◀ active", style="bold")
+            else:
+                table.add_row(m, "")
+        console.print(Panel(table, title="LLM Models", border_style="cyan", padding=(1, 1)))
     else:
         new_model = parts[0]
         config.llm_model = new_model
@@ -219,14 +237,15 @@ def _cmd_model(args: str):
             runtime_settings.llm_model = new_model
         except Exception:
             pass
-        print(f"  Model set to: {new_model}")
+        console.print(f"  [success]Model set to:[/success] {new_model}")
 
 
 def _cmd_headless(args: str):
-    global _headless, _browser
+    global _headless
     parts = args.strip().lower().split()
     if not parts:
-        print(f"  Headless mode: {'on' if _headless else 'off'}")
+        state = "on" if _headless else "off"
+        console.print(f"  Headless mode: [info]{state}[/info]")
         return
 
     val = parts[0]
@@ -235,34 +254,43 @@ def _cmd_headless(args: str):
     elif val in ("off", "false", "0", "no"):
         _headless = False
     else:
-        print(f"  Usage: /headless [on|off]")
+        console.print("  [warning]Usage:[/warning] /headless [on|off]")
         return
 
     config.headless = _headless
-    # Force a new browser on next task with the new setting
-    if _browser is not None:
-        print("  Note: Browser will restart with new setting on next task.")
-        # Schedule close; next _get_browser() will create a new one
-        asyncio.get_event_loop().create_task(_close_browser())
 
-    print(f"  Headless mode: {'on' if _headless else 'off'}")
+    state = "on" if _headless else "off"
+    console.print(f"  [success]Headless mode:[/success] {state}")
 
 
 def _cmd_history():
     if not _history:
-        print("  No tasks in this session yet.\n")
+        console.print("  [muted]No tasks in this session yet.[/muted]\n")
         return
-    print()
+    table = Table(title="Session History", border_style="cyan", padding=(0, 1))
+    table.add_column("#", style="muted", width=3)
+    table.add_column("Time", style="muted", width=8)
+    table.add_column("Source", width=6)
+    table.add_column("Task")
+    table.add_column("Status", width=8)
     for i, entry in enumerate(_history, 1):
-        status = "ok" if entry["success"] else ("stopped" if entry.get("cancelled") else "failed")
-        task_preview = entry["task"][:70] + ("..." if len(entry["task"]) > 70 else "")
-        print(f"  {i}. {status} [{entry['time']}] {task_preview}")
-    print()
+        if entry["success"]:
+            status = "[success]✓ done[/success]"
+        elif entry.get("cancelled"):
+            status = "[warning]⊘ stop[/warning]"
+        else:
+            status = "[error]✗ fail[/error]"
+        source = entry.get("source", "cli")
+        source_styled = f"[info]{source}[/info]" if source == "api" else source
+        task_preview = entry["task"][:60] + ("…" if len(entry["task"]) > 60 else "")
+        table.add_row(str(i), entry["time"], source_styled, task_preview, status)
+    console.print(table)
+    console.print()
 
 
 def _cmd_clear():
     _history.clear()
-    print("  Session history cleared.")
+    console.print("  [success]Session history cleared.[/success]")
 
 
 def _cmd_key(args: str):
@@ -272,15 +300,15 @@ def _cmd_key(args: str):
         key = config.google_api_key
         if key:
             masked = key[:4] + "..." + key[-4:] if len(key) > 8 else "****"
-            print(f"  Current API key: {masked}")
+            console.print(f"  Current API key: [info]{masked}[/info]")
         else:
-            print("  No API key set.")
+            console.print("  [warning]No API key set.[/warning]")
         return
 
     # Set new key
     os.environ["GOOGLE_API_KEY"] = parts
     config.google_api_key = parts
-    print(f"  API key updated.")
+    console.print("  [success]API key updated.[/success]")
 
     try:
         save = input("  Save to .env? (Y/n) > ").strip().lower()
@@ -289,7 +317,7 @@ def _cmd_key(args: str):
 
     if save in ("", "y", "yes"):
         _save_key_to_dotenv(parts)
-        print("  Saved to .env")
+        console.print("  [success]Saved to .env[/success]")
 
 
 async def _cmd_load(args: str):
@@ -310,31 +338,31 @@ async def _cmd_load(args: str):
             workflow_id = parts[idx + 1]
 
     if not csv_path.exists():
-        print(f"  Error: File not found: {csv_path}")
+        console.print(f"  [error]File not found:[/error] {csv_path}")
         return
 
-    print(f"  Loading workflow from: {csv_path}")
+    console.print(f"  Loading workflow from: [info]{csv_path}[/info]")
     try:
         loader = WorkflowLoader(csv_path)
         workflow = loader.load_single(workflow_id)
     except Exception as e:
-        print(f"  Error: Failed to load workflow: {e}")
+        console.print(f"  [error]Failed to load workflow:[/error] {e}")
         return
 
-    print(f"  Workflow: {workflow.workflow_id} ({len(workflow.events)} events)")
-    print(f"  Start URL: {workflow.start_url}")
+    console.print(f"  Workflow: [info]{workflow.workflow_id}[/info] ({len(workflow.events)} events)")
+    console.print(f"  Start URL: [info]{workflow.start_url}[/info]")
 
-    print("\n  Generating task description...")
-    try:
-        config.validate()
-        llm_client = LLMClient()
-        task_description = llm_client.generate_task_description(workflow)
-    except Exception as e:
-        print(f"  Error: LLM generation failed: {e}")
-        return
+    with console.status("Generating task description...", spinner="dots"):
+        try:
+            config.validate()
+            llm_client = LLMClient()
+            task_description = llm_client.generate_task_description(workflow)
+        except Exception as e:
+            console.print(f"  [error]LLM generation failed:[/error] {e}")
+            return
 
-    print(f"\n  Generated task:")
-    print(f"     {task_description}\n")
+    console.print(f"\n  [success]Generated task:[/success]")
+    console.print(f"     {task_description}\n")
 
     # Ask to run
     try:
@@ -354,51 +382,58 @@ async def _cmd_load(args: str):
 # ---------------------------------------------------------------------------
 
 async def _execute_task(task_description: str, sensitive_data: Optional[dict] = None):
-    """Execute a task with Ctrl+C cancellation support."""
-    global _current_task
+    """Execute a task with Ctrl+C cancellation support via shared task manager."""
+    from .task_manager import task_manager, TaskSource, BusyError
 
     loop = asyncio.get_event_loop()
 
-    # Create the task
-    _current_task = asyncio.create_task(
-        _run_task(task_description, sensitive_data=sensitive_data)
-    )
+    # Submit through the shared task manager (rejects if busy)
+    try:
+        info = task_manager.submit(
+            _run_task(task_description, sensitive_data=sensitive_data),
+            description=task_description,
+            source=TaskSource.CLI,
+        )
+    except BusyError as e:
+        console.print(f"\n  [warning]⚠  {e}[/warning]")
+        console.print("  [muted]Wait for it to finish, or press Ctrl+C to cancel it.[/muted]\n")
+        return
 
-    print("  (press Ctrl+C to stop the task)\n")
+    console.print("  [muted](press Ctrl+C to stop the task)[/muted]\n")
 
     # Install SIGINT handler that cancels the running task
     original_handler = signal.getsignal(signal.SIGINT)
 
     def _cancel_handler(signum, frame):
-        if _current_task and not _current_task.done():
-            _current_task.cancel()
+        task_manager.cancel(info.id)
 
     signal.signal(signal.SIGINT, _cancel_handler)
 
     try:
-        result = await _current_task
+        result = await info.asyncio_task
         _history.append({
             "task": task_description,
             "success": result.get("success", False),
             "cancelled": False,
             "time": datetime.now().strftime("%H:%M:%S"),
+            "source": "cli",
         })
         if result["success"]:
-            print("\n  Task completed.")
+            console.print("\n  [success]✓ Task completed.[/success]")
         else:
-            print(f"\n  Error: {result.get('error', 'Unknown error')}")
+            console.print(f"\n  [error]✗ Error:[/error] {result.get('error', 'Unknown error')}")
 
     except asyncio.CancelledError:
-        print("\n  Task cancelled.")
+        console.print("\n  [warning]⊘ Task cancelled.[/warning]")
         _history.append({
             "task": task_description,
             "success": False,
             "cancelled": True,
             "time": datetime.now().strftime("%H:%M:%S"),
+            "source": "cli",
         })
 
     finally:
-        _current_task = None
         signal.signal(signal.SIGINT, original_handler)
 
 
@@ -435,24 +470,97 @@ async def start_chat(port: int = 5001):
 
     _print_banner(port)
 
-    loop = asyncio.get_event_loop()
-    ctrl_c_count = 0
+    # --- Register shared task-manager callbacks so the CLI shows API tasks ---
+    from .task_manager import task_manager, TaskSource, TaskStatus
+
+    def _on_api_task_start(info):
+        if info.source == TaskSource.API:
+            preview = info.description[:70] + ("..." if len(info.description) > 70 else "")
+            console.print(f"\n  [info]\U0001f310 \\[extension] Task started:[/info] {preview}")
+            console.print(f"     [muted]id={info.id}[/muted]")
+
+    def _on_api_task_end(info):
+        if info.source == TaskSource.API:
+            preview = info.description[:70] + ("..." if len(info.description) > 70 else "")
+            if info.status == TaskStatus.COMPLETED:
+                console.print(f"\n  [success]\u2713 \\[extension] Task finished:[/success] {preview}")
+            else:
+                console.print(f"\n  [error]\u2717 \\[extension] Task finished:[/error] {preview}")
+            _history.append({
+                "task": info.description,
+                "success": info.status == TaskStatus.COMPLETED,
+                "cancelled": info.status == TaskStatus.CANCELLED,
+                "time": (info.finished_at or info.created_at).strftime("%H:%M:%S"),
+                "source": "api",
+            })
+
+    task_manager.on_task_start(_on_api_task_start)
+    task_manager.on_task_end(_on_api_task_end)
+
+    loop = asyncio.get_running_loop()
+    _quit_event = asyncio.Event()
+    _ctrl_c_count = 0
+
+    # Thread pool for blocking input() calls.
+    # On shutdown, os._exit(0) in the finally block kills the process
+    # immediately — no need for daemon threads.
+    _input_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="repl-input"
+    )
+
+    def _repl_sigint_handler(signum, frame):
+        """Handle Ctrl+C at the REPL prompt."""
+        nonlocal _ctrl_c_count
+        _ctrl_c_count += 1
+
+        if _ctrl_c_count >= 2:
+            # Second Ctrl+C → hard-exit immediately (no waiting)
+            console.print("\n  [error]Force quitting...[/error]")
+            os._exit(130)
+
+        # First Ctrl+C → request graceful shutdown
+        console.print("\n  [warning]👋 Shutting down (press Ctrl+C again to force)...[/warning]")
+        # Wake the event loop so it can process the quit
+        try:
+            loop.call_soon_threadsafe(_quit_event.set)
+        except RuntimeError:
+            # Loop already closed — force exit
+            os._exit(130)
+
+    signal.signal(signal.SIGINT, _repl_sigint_handler)
+
+    _prompt = Text.from_markup("[bold cyan]>[/bold cyan] ")
+
+    def _read_input() -> str | None:
+        """Read one line from stdin (runs in daemon thread)."""
+        try:
+            return console.input(_prompt)
+        except (EOFError, OSError):
+            return None
+        except KeyboardInterrupt:
+            return ""          # return empty, handled by signal handler
 
     try:
-        while True:
-            # Read input without blocking the event loop
-            try:
-                ctrl_c_count = 0  # reset on successful prompt
-                user_input = await loop.run_in_executor(None, input, "you > ")
-            except EOFError:
-                # Ctrl+D
+        while not _quit_event.is_set():
+            # Read input in the daemon-thread executor
+            read_fut = loop.run_in_executor(_input_executor, _read_input)
+            # Wait for EITHER user input OR the quit signal
+            quit_wait = asyncio.ensure_future(_quit_event.wait())
+            done, pending = await asyncio.wait(
+                {read_fut, quit_wait}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for p in pending:
+                p.cancel()
+
+            if _quit_event.is_set():
                 break
-            except KeyboardInterrupt:
-                ctrl_c_count += 1
-                if ctrl_c_count >= 2:
-                    break
-                print("\n  Press Ctrl+C again to exit, or type /quit")
-                continue
+
+            result = read_fut.result() if read_fut in done else None
+            if result is None:
+                # EOF (Ctrl+D) or stdin closed
+                break
+
+            user_input = result
 
             line = user_input.strip()
             if not line:
@@ -481,7 +589,7 @@ async def start_chat(port: int = 5001):
                 elif cmd == "/key":
                     _cmd_key(cmd_args)
                 else:
-                    print(f"  Unknown command: {cmd}. Type /help for available commands.")
+                    console.print(f"  [warning]Unknown command:[/warning] {cmd}. Type [accent]/help[/accent] for available commands.")
                 continue
 
             # --- Task execution ---
@@ -489,9 +597,8 @@ async def start_chat(port: int = 5001):
 
     finally:
         # Clean shutdown
-        print("\n👋 Shutting down...")
+        console.print("\n  [info]👋 Shutting down...[/info]")
 
-        await _close_browser()
 
         server.should_exit = True
         try:
@@ -503,4 +610,17 @@ async def start_chat(port: int = 5001):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        print("   Goodbye!\n")
+        # Shut down the daemon-thread executor (don't wait for the
+        # blocked input() thread — it's a daemon and will die with
+        # the process).
+        _input_executor.shutdown(wait=False, cancel_futures=True)
+
+        console.print("   [muted]Goodbye![/muted]\n")
+
+        # Close stdin to unblock any lingering input() thread, then
+        # hard-exit so Python's threading atexit handler doesn't hang.
+        try:
+            sys.stdin.close()
+        except Exception:
+            pass
+        os._exit(0)

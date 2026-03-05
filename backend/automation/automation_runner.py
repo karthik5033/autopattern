@@ -4,10 +4,13 @@ Uses browser-use to execute tasks based on LLM-generated descriptions.
 """
 
 import asyncio
+import logging
 import os
 from typing import Optional
 
 from .config import config
+
+logger = logging.getLogger("autopattern.runner")
 
 
 class AutomationRunner:
@@ -104,34 +107,31 @@ class AutomationRunner:
         )
         
         try:
-            print(f"\n🚀 Starting automation task:")
-            print(f"   Original task: {task_description[:100]}...")
-            print(f"   Headless: {self.headless}")
-            print(f"   Model: {self.llm_model}")
-            print(f"   Sensitive Data: {'Yes - ' + str(len(sensitive_data)) + ' values' if sensitive_data else 'No'}")
-            
+            logger.info("Starting automation task: %s...", task_description[:100])
+            logger.info("  Headless=%s  Model=%s  Sensitive=%s",
+                        self.headless, self.llm_model,
+                        f"Yes - {len(sensitive_data)} values" if sensitive_data else "No")
+
             history = await agent.run()
-            
-            print(f"✅ Agent execution finished")
+
+            logger.info("Agent execution finished")
             if hasattr(history, 'all_results'):
-                print(f"   Results: {len(history.all_results())} actions performed")
-            
+                logger.info("  %d actions performed", len(history.all_results()))
+
             # NOTE: Browser stays open after automation - user can close manually
-            print(f"   Browser window kept open for review")
-            
+            logger.debug("Browser window kept open for review")
+
             return {
                 "success": True,
                 "history": history,
                 "task": task_description,
             }
         except Exception as e:
-            print(f"❌ Automation failed: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # NOTE: Browser stays open after error for debugging - user can close manually
-            print(f"   Browser window kept open for debugging")
-            
+            logger.error("Automation failed: %s", e, exc_info=True)
+
+            # NOTE: Browser stays open after error for debugging
+            logger.debug("Browser window kept open for debugging")
+
             return {
                 "success": False,
                 "error": str(e),
