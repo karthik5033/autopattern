@@ -60,7 +60,7 @@ export function CTA() {
                         </svg>
                     </a>
                     <a
-                        href="https://github.com/AadityaChaudhary/autopattern"
+                        href="https://github.com/autopattern/autopattern"
                         target="_blank"
                         className="px-10 py-5 rounded-full border border-white/20 font-semibold text-lg hover:bg-white/10 transition-all flex items-center gap-3"
                     >

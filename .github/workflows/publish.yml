@@ -6,7 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-publish:
+  # ── autopattern (main backend package) ─────────────────────────────────────
+  publish-backend:
+    name: Publish autopattern
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -35,3 +37,35 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: backend/dist/
+
+  # ── autopattern-install (bootstrapper package) ─────────────────────────────
+  publish-installer:
+    name: Publish autopattern-install
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: installer
+
+    permissions:
+      id-token: write  # for trusted publishing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build package
+        run: python -m build
+
+      - name: Check package
+        run: twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: installer/dist/

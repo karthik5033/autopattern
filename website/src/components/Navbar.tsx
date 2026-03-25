@@ -64,7 +64,7 @@ export function Navbar() {
                             Demo
                         </Link>
                         <Link
-                            href="https://github.com/AadityaChaudhary/autopattern"
+                            href="https://github.com/autopattern/autopattern"
                             target="_blank"
                             className="text-gray-400 hover:text-white transition-colors"
                         >

@@ -7,7 +7,7 @@ Get a working dev environment from a fresh clone.
 
 1. **Clone and enter the repo**
    ```bash
-   git clone https://github.com/AadityaChaudhary/autopattern.git
+   git clone https://github.com/autopattern/autopattern.git
    cd autopattern
    ```
 

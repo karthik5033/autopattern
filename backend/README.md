@@ -52,7 +52,7 @@ This starts:
 
 ```
 ╭────────────────────────────────────────────╮
-│          ⚡ AutoPattern v0.2.0             │
+│          ⚡ AutoPattern v0.2.2              │
 │   AI-powered browser automation from CLI   │
 ╰────────────────────────────────────────────╯
 
@@ -116,7 +116,7 @@ print(result["success"])
 
 ## Chrome Extension
 
-The companion Chrome extension records your browser interactions and sends them to AutoPattern's API for replay. Install it from the `extension/` directory in the [source repo](https://github.com/AadityaChaudhary/autopattern).
+The companion Chrome extension records your browser interactions and sends them to AutoPattern's API for replay. Install it from the `extension/` directory in the [source repo](https://github.com/autopattern/autopattern).
 
 ---
 
@@ -137,7 +137,7 @@ When AutoPattern is running (via `autopattern` or `autopattern --server`):
 ## Development
 
 ```bash
-git clone https://github.com/AadityaChaudhary/autopattern.git
+git clone https://github.com/autopattern/autopattern.git
 cd autopattern/backend
 pip install -e ".[dev]"
 playwright install chromium
@@ -147,5 +147,5 @@ playwright install chromium
 
 ## License
 
-MIT — see [LICENSE](https://github.com/AadityaChaudhary/autopattern/blob/main/LICENSE).
+MIT — see [LICENSE](https://github.com/autopattern/autopattern/blob/main/LICENSE).
 

@@ -93,7 +93,7 @@ class AutomateResponse(BaseModel):
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str = "ok"
-    version: str = "0.2.0"
+    version: str = "0.2.2"
     active_tasks: int = 0
     draining: bool = False
 
@@ -139,7 +139,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AutoPattern API",
     description="Browser automation powered by AI",
-    version="0.2.0",
+    version="0.2.2",
     lifespan=lifespan,
 )
 

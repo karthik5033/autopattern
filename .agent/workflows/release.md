@@ -46,8 +46,30 @@ autopattern --help
 ## Publish
 
 ### Option A: GitHub Release (triggers CI)
-1. Create a GitHub release with tag `vX.Y.Z`
-2. The `.github/workflows/publish.yml` workflow will build and publish to PyPI
+
+1. Write release notes to a temp file (do **not** use `git tag -m "..."` inline — long messages lose formatting):
+   ```bash
+   cat > /tmp/RELEASE_NOTES.md << 'EOF'
+   vX.Y.Z — Short title
+
+   ## What's New
+
+   ### Backend
+   - Change one
+   - Change two
+
+   ## Install
+   \`\`\`bash
+   pipx install autopattern==X.Y.Z
+   \`\`\`
+   EOF
+   ```
+2. Create the annotated tag using `--cleanup=verbatim` so markdown `##` headers are **not** stripped as git comments:
+   ```bash
+   git tag -a vX.Y.Z --cleanup=verbatim -F /tmp/RELEASE_NOTES.md HEAD
+   git push origin vX.Y.Z
+   ```
+3. Create a GitHub release from the tag — the `.github/workflows/publish.yml` workflow triggers on `release: [published]` and will build and publish to PyPI
 
 ### Option B: Manual publish
 ```bash

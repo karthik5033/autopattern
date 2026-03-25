@@ -66,7 +66,7 @@ export function Footer() {
                         <ul className="space-y-2 text-gray-400">
                             <li>
                                 <a
-                                    href="https://github.com/AadityaChaudhary/autopattern"
+                                    href="https://github.com/autopattern/autopattern"
                                     target="_blank"
                                     className="hover:text-white transition-colors"
                                 >
@@ -75,7 +75,7 @@ export function Footer() {
                             </li>
                             <li>
                                 <a
-                                    href="https://github.com/AadityaChaudhary/autopattern/issues"
+                                    href="https://github.com/autopattern/autopattern/issues"
                                     target="_blank"
                                     className="hover:text-white transition-colors"
                                 >
@@ -103,7 +103,7 @@ export function Footer() {
                     </p>
                     <div className="flex items-center gap-6">
                         <a
-                            href="https://github.com/AadityaChaudhary/autopattern"
+                            href="https://github.com/autopattern/autopattern"
                             target="_blank"
                             className="text-gray-400 hover:text-white transition-colors"
                         >
