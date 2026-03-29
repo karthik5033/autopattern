@@ -13,15 +13,14 @@ That's it. The installer will:
 
 1. Install `uv` (if not already present)
 2. Install AutoPattern using Python 3.13 (isolated, no conflicts)
-3. Download Chromium via Playwright automatically
-4. Prompt for your Google AI API key
+3. Prompt for your Google AI API key
 
 ## What this solves
 
 Installing AutoPattern directly via `pip` or `pipx` leaves two invisible traps:
 
 - **Python version** — AutoPattern requires ≥ 3.11, ≤ 3.13. This installer pins to 3.13 automatically.
-- **Missing Playwright browsers** — `playwright install chromium` must be run after install. This installer does it for you.
+
 
 ## After installation
 

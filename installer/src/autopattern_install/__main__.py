@@ -25,7 +25,7 @@ if platform.system() == "Windows":
     # Enable VT processing on modern Windows terminals
     try:
         import ctypes
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = getattr(ctypes, "windll").kernel32
         kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
         ANSI = True
     except Exception:
@@ -95,7 +95,7 @@ def _ensure_uv() -> str:
     if uv_path:
         result = subprocess.run([uv_path, "--version"], capture_output=True, text=True)
         _ok(f"uv found  {dim(result.stdout.strip())}")
-        return uv_path
+        return str(uv_path)
 
     _step("uv not found — installing it now…")
     system = platform.system()
@@ -147,7 +147,7 @@ def _ensure_uv() -> str:
         sys.exit(1)
 
     _ok(f"uv installed → {dim(uv_path)}")
-    return uv_path
+    return str(uv_path)
 
 
 def _install_autopattern(uv: str):
@@ -169,45 +169,6 @@ def _install_autopattern(uv: str):
 
     _ok(f"autopattern installed")
 
-
-def _install_playwright_browsers(uv: str):
-    """Run `playwright install chromium` inside the uv tool venv."""
-    _step("Installing Chromium browser for Playwright…")
-    print()
-
-    # Find playwright inside the uv-managed tool environment
-    playwright_bin = _find_uv_tool_bin("playwright")
-
-    if playwright_bin:
-        result = _run([playwright_bin, "install", "chromium"])
-    else:
-        # Fallback: use `uv run` in the tool env
-        result = _run([uv, "tool", "run", "--from", PACKAGE_NAME, "playwright", "install", "chromium"])
-
-    print()
-    if result.returncode != 0:
-        _warn("Playwright browser install failed. You can run it manually:")
-        print(f"      playwright install chromium")
-    else:
-        _ok("Chromium installed")
-
-
-def _find_uv_tool_bin(name: str) -> str | None:
-    """Locate a binary inside the uv tool environment for autopattern."""
-    # uv tools dir: ~/.local/share/uv/tools/<package>/bin/<name>  (Unix)
-    #               %LOCALAPPDATA%\uv\tools\<package>\Scripts\<name>.exe  (Windows)
-    system = platform.system()
-    if system == "Windows":
-        base = Path(os.environ.get("LOCALAPPDATA", "")) / "uv" / "tools" / PACKAGE_NAME / "Scripts"
-        candidates = [base / f"{name}.exe", base / name]
-    else:
-        base = Path.home() / ".local" / "share" / "uv" / "tools" / PACKAGE_NAME / "bin"
-        candidates = [base / name]
-
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return None
 
 
 def _configure_api_key():
@@ -239,7 +200,8 @@ def _configure_api_key():
     env_file = _find_env_file()
     if env_file:
         try:
-            env_file.write_text(f'GOOGLE_API_KEY="{key}"\n', encoding="utf-8")
+            with env_file.open("a", encoding="utf-8") as f:
+                f.write(f'\nGOOGLE_API_KEY="{key}"\n')
             _ok(f"API key saved → {dim(str(env_file))}")
         except OSError as e:
             _warn(f"Could not write key to file: {e}")
@@ -253,17 +215,19 @@ def _find_env_file() -> Path | None:
     """Find the automation/.env inside the uv tool venv."""
     system = platform.system()
     if system == "Windows":
-        base = Path(os.environ.get("LOCALAPPDATA", "")) / "uv" / "tools" / PACKAGE_NAME
-        glob_pattern = "Scripts/automation/.env"
+        local_app_data = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        base = Path(local_app_data) / "uv" / "tools" / PACKAGE_NAME
+        site_packages_glob = "Lib/site-packages/automation"
     else:
         base = Path.home() / ".local" / "share" / "uv" / "tools" / PACKAGE_NAME
+        site_packages_glob = "lib/python*/site-packages/automation"
 
     # Walk lib/pythonX.YY/site-packages/automation/.env
-    for candidate in base.glob("lib/python*/site-packages/automation/.env"):
+    for candidate in base.glob(f"{site_packages_glob}/.env"):
         return candidate
 
     # If not found yet, create it
-    for candidate in base.glob("lib/python*/site-packages/automation/"):
+    for candidate in base.glob(f"{site_packages_glob}"):
         return candidate / ".env"
 
     return None
@@ -299,7 +263,6 @@ def main():
     uv = _ensure_uv()
 
     _install_autopattern(uv)
-    _install_playwright_browsers(uv)
     _configure_api_key()
     _print_success()
 

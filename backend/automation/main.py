@@ -3,6 +3,7 @@ Main entry point for the workflow-to-automation pipeline.
 
 Usage:
     autopattern                             # interactive chat + API server
+    autopattern --setup                     # guided setup (Playwright + API key)
     autopattern --workflow <path-to-csv>
     autopattern --task "Navigate to google.com and search for Python"
     autopattern --server                    # API server only (no chat)
@@ -47,6 +48,11 @@ def parse_args():
         "--server",
         action="store_true",
         help="Run as API server for extension integration",
+    )
+    group.add_argument(
+        "--setup",
+        action="store_true",
+        help="Guided setup (installs Playwright browsers and configures API key)",
     )
     
     parser.add_argument(
@@ -142,11 +148,40 @@ async def main_async(args):
     return 0
 
 
+def run_setup():
+    """Guided setup for first-time users."""
+    print("\n⚡ AutoPattern Setup")
+    print("─────────────────────")
+    # 2. Config / API Key
+    from .config import config, env_path
+    if not config.google_api_key:
+        print("\n→ Google API Key missing.")
+        print("   Get one at: https://aistudio.google.com/app/apikey")
+        key = input("\n   Paste your GOOGLE_API_KEY (or Enter to skip): ").strip()
+        if key:
+            try:
+                # Write to the specific env file the config module uses
+                with open(env_path, "a") as f:
+                    f.write(f'\nGOOGLE_API_KEY="{key}"\n')
+                print(f"Key saved to {env_path}")
+            except Exception as e:
+                print(f"Could not save key: {e}")
+    else:
+        print("\nGOOGLE_API_KEY is already configured.")
+
+    print("\n✨ Setup complete! Run 'autopattern' to start.")
+
+
 def main():
     """Entry point for CLI."""
     try:
         args = parse_args()
         
+        # Handle setup mode
+        if args.setup:
+            run_setup()
+            sys.exit(0)
+
         # Handle server-only mode
         if args.server:
             from .server import run_server

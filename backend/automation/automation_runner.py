@@ -26,7 +26,48 @@ class AutomationRunner:
     
     def _create_browser(self):
         """Create browser instance."""
+        import platform
+        import shutil
+        import os
+        from pathlib import Path
         from browser_use import Browser
+
+        def find_chrome():
+            sys_name = platform.system()
+            if sys_name == "Darwin":
+                for path in [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                ]:
+                    if Path(path).exists():
+                        return path
+            elif sys_name == "Windows":
+                local_app = os.environ.get("LOCALAPPDATA", "")
+                p_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+                p_files_x86 = os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)")
+                
+                win_paths = [
+                    Path(p_files) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                    Path(p_files_x86) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                    Path(local_app) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                ]
+                for p in win_paths:
+                    if p.exists():
+                        return str(p)
+            else:
+                for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
+                    p = shutil.which(name)
+                    if p:
+                        return p
+            return None
+
+        chrome_path = find_chrome()
+        if chrome_path:
+            logger.info("Using system Chrome found at: %s", chrome_path)
+            return Browser(headless=self.headless, executable_path=chrome_path)
+        
+        logger.warning("System Chrome not found. Falling back to default Playwright browser.")
         return Browser(headless=self.headless)
     
     def _create_tools(self):

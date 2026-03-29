@@ -27,7 +27,7 @@ from rich.theme import Theme
 
 from .config import config
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 # ---------------------------------------------------------------------------
 # Rich console (shared)
