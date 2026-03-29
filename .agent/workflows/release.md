@@ -1,91 +1,124 @@
 # Workflow: Release
 
-## Goal
-Build, test, and publish a new version of AutoPattern.
+## Versioning Policy
 
-## Pre-release
+Both packages **always share the same version number** and are released together.
 
-1. **Bump version** in two places:
-   - `backend/pyproject.toml` → `version = "X.Y.Z"`
-   - `backend/automation/chat.py` → `VERSION = "X.Y.Z"`
+| File | Key |
+|---|---|
+| `backend/pyproject.toml` | `version = "X.Y.Z"` |
+| `backend/automation/chat.py` | `VERSION = "X.Y.Z"` |
+| `installer/pyproject.toml` | `version = "X.Y.Z"` |
 
-2. **Verify everything works locally**
-   ```bash
-   cd backend
-   uv tool install --force --reinstall .
-   autopattern          # test chat mode
-   autopattern --server # test server mode
-   ```
+---
 
-3. **Run tests**
-   ```bash
-   cd backend
-   uv run pytest
-   ```
-
-## Build
+## Step 1 — Bump Versions (all three files)
 
 ```bash
-cd backend
-uv run python -m build
+# Replace X.Y.Z with the new version in all three places
+sed -i '' 's/^version = ".*/version = "X.Y.Z"/' backend/pyproject.toml
+sed -i '' 's/^version = ".*/version = "X.Y.Z"/' installer/pyproject.toml
+sed -i '' 's/^VERSION = ".*/VERSION = "X.Y.Z"/' backend/automation/chat.py
 ```
 
-Produces `dist/autopattern-X.Y.Z.tar.gz` and `dist/autopattern-X.Y.Z-py3-none-any.whl`.
+Verify:
+```bash
+grep -E '^version|^VERSION' backend/pyproject.toml installer/pyproject.toml backend/automation/chat.py
+```
 
-## Verify the built package
+---
+
+## Step 2 — Local Pre-flight Tests
+
+### 2a. Test the backend directly from source (Python 3.13)
+```bash
+cd backend
+uv tool install --python 3.13 --force --reinstall .
+autopattern --help
+autopattern --server &   # start server in background
+sleep 3 && curl -s http://localhost:5001/api/status | python3 -m json.tool
+kill %1                  # stop background server
+```
+
+### 2b. Test the installer on the system Python (simulates end-user)
+```bash
+# Always test on the system Python (could be 3.9, 3.10, etc.)
+python3 -c "
+import sys
+sys.path.insert(0, 'installer/src')
+from autopattern_install.__main__ import main
+print('Installer imports OK on Python', sys.version)
+"
+```
+
+### 2c. Run tests
+```bash
+cd backend
+uv run pytest
+```
+
+### 2d. Build and verify package metadata
+```bash
+cd backend && uv run python -m build
+uv run twine check dist/*
+```
+
+---
+
+## Step 3 — Publish via GitHub Release
 
 ```bash
-# Check package metadata
-uv run twine check dist/*
+cat > /tmp/RELEASE_NOTES.md << 'EOF'
+vX.Y.Z — Short title
 
-# Test install from wheel
-uv tool install --force dist/autopattern-X.Y.Z-py3-none-any.whl
+## What's New
+
+### Backend
+- Change one
+
+### Installer
+- Change two
+
+## Install
+```bash
+# Fresh install
+pip install autopattern-install && autopattern-install
+# Or direct
+pipx install autopattern==X.Y.Z
+```
+EOF
+
+git commit -am "chore: release vX.Y.Z"
+git push origin main
+git tag -a vX.Y.Z --cleanup=verbatim -F /tmp/RELEASE_NOTES.md HEAD
+git push origin vX.Y.Z
+gh release create vX.Y.Z -F /tmp/RELEASE_NOTES.md --title "vX.Y.Z — Short title"
+```
+
+The `publish.yml` CI will build and push both packages to PyPI automatically.
+
+---
+
+## Step 4 — Post-release Verification
+
+```bash
+# Wait ~2 min for PyPI to index, then verify
+pip index versions autopattern
+pip index versions autopattern-install
+
+# Full end-to-end test from PyPI
+pip install --upgrade autopattern-install
+autopattern-install
 autopattern --help
 ```
 
-## Publish
-
-### Option A: GitHub Release (triggers CI)
-
-1. Write release notes to a temp file (do **not** use `git tag -m "..."` inline — long messages lose formatting):
-   ```bash
-   cat > /tmp/RELEASE_NOTES.md << 'EOF'
-   vX.Y.Z — Short title
-
-   ## What's New
-
-   ### Backend
-   - Change one
-   - Change two
-
-   ## Install
-   \`\`\`bash
-   pipx install autopattern==X.Y.Z
-   \`\`\`
-   EOF
-   ```
-2. Create the annotated tag using `--cleanup=verbatim` so markdown `##` headers are **not** stripped as git comments:
-   ```bash
-   git tag -a vX.Y.Z --cleanup=verbatim -F /tmp/RELEASE_NOTES.md HEAD
-   git push origin vX.Y.Z
-   ```
-3. Create a GitHub release from the tag — the `.github/workflows/publish.yml` workflow triggers on `release: [published]` and will build and publish to PyPI
-
-### Option B: Manual publish
-```bash
-cd backend
-uv run twine upload dist/*
-```
-
-## Post-release
-- Verify on PyPI: `pip index versions autopattern`
-- Test install: `pipx install autopattern && autopattern`
-- Update README if needed
+---
 
 ## Checklist
-- [ ] Version bumped in pyproject.toml and chat.py
-- [ ] Tests pass
-- [ ] Package builds cleanly
-- [ ] `twine check` passes
-- [ ] Published to PyPI
-- [ ] Installable via `pipx install autopattern`
+- [ ] All three version strings match (`backend/pyproject.toml`, `installer/pyproject.toml`, `chat.py`)
+- [ ] `autopattern --help` works after local install
+- [ ] Installer imports cleanly on system Python
+- [ ] Tests pass (`uv run pytest`)
+- [ ] `twine check dist/*` passes
+- [ ] GitHub release created and CI triggered
+- [ ] Both packages visible on PyPI at correct version
