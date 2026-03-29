@@ -245,7 +245,8 @@ def _print_success():
     print(f"  {bold('Modes:')}")
     print(f"    {cyan('autopattern')}                 interactive chat + API server")
     print(f"    {cyan('autopattern --server')}        API server only (for extension)")
-    print(f"    {cyan('autopattern --task \"...\"')}   run a single task directly")
+    task_cmd = 'autopattern --task "..."'
+    print(f"    {cyan(task_cmd)}   run a single task directly")
     print()
     print(f"  {bold('Browser extension:')}")
     print(f"    {dim('Download the .zip from GitHub Releases and load it in Chrome.')}")
