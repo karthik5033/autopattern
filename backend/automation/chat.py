@@ -47,9 +47,9 @@ console = Console(theme=_theme, highlight=False)
 AVAILABLE_MODELS = [
     "gemini-flash-latest",
     "gemini-pro-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.0-flash",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
 ]
 
 def _print_help():

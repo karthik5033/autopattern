@@ -73,9 +73,9 @@ export function Navbar() {
                     </div>
 
                     {/* CTA Button */}
-                    <a
-                        href="chrome-extension://oigefdjfcokhefifcockgnpjfgefomdd/src/ui/dashboard.html"
-                        className="hidden md:flex items-center gap-2 px-5 py-2.5 rounded-full bg-gradient-to-r from-purple-600 to-cyan-600 hover:from-purple-500 hover:to-cyan-500 transition-all hover:scale-105 font-medium"
+                    <button
+                        onClick={() => alert('Please install/load the AutoPattern extension in Chrome (chrome://extensions) to access the dashboard. If installed, click the extension icon.')}
+                        className="hidden md:flex items-center gap-2 px-5 py-2.5 rounded-full bg-gradient-to-r from-purple-600 to-cyan-600 hover:from-purple-500 hover:to-cyan-500 transition-all hover:scale-105 font-medium cursor-pointer border-none"
                     >
                         <svg
                             className="w-5 h-5"
@@ -91,7 +91,7 @@ export function Navbar() {
                             />
                         </svg>
                         Open Dashboard
-                    </a>
+                    </button>
 
                     {/* Mobile Menu Button */}
                     <button className="md:hidden p-2 rounded-lg hover:bg-white/10 transition-colors">

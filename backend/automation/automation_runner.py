@@ -1,6 +1,10 @@
 """
 Automation Runner module.
 Uses browser-use to execute tasks based on LLM-generated descriptions.
+
+Supports multi-key rotation via KeyManager and subtask splitting via
+TaskSplitter. Automatically falls back between Groq and Gemini when
+a provider hits rate limits.
 """
 
 import asyncio
@@ -9,8 +13,48 @@ import os
 from typing import Optional
 
 from .config import config
+from .key_manager import key_manager
+from .task_splitter import split_task
 
 logger = logging.getLogger("autopattern.runner")
+
+# Rate-limit error substrings (case-insensitive matching)
+_RATE_LIMIT_MARKERS = ("429", "quota", "exhausted", "rate", "resource_exhausted", "503", "unavailable")
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    """Return True if *error* looks like an API rate-limit / quota error."""
+    msg = str(error).lower()
+    return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# LLM builder — picks Groq or Gemini based on KeyManager availability
+# ---------------------------------------------------------------------------
+
+def build_llms():
+    """Build the main Agent LLM and the page extraction LLM using different Gemini keys."""
+    from browser_use import ChatGoogle
+    
+    # 1. Main LLM
+    main_key = key_manager.get_next_gemini_key()
+    if not main_key:
+        raise RuntimeError("All Gemini API keys are exhausted or cooling down.")
+
+    os.environ["GOOGLE_API_KEY"] = main_key
+    llm = ChatGoogle(model="gemini-flash-latest")
+    logger.info("Built main LLM: Gemini (gemini-flash-latest)")
+
+    # 2. Extraction LLM
+    ext_key = key_manager.get_next_gemini_key()
+    if ext_key:
+        os.environ["GOOGLE_API_KEY"] = ext_key
+        page_extraction_llm = ChatGoogle(model="gemini-flash-lite-latest")
+        logger.info("Built extraction LLM: Gemini (gemini-flash-lite-latest)")
+    else:
+        page_extraction_llm = None
+
+    return llm, main_key, page_extraction_llm, ext_key
 
 
 class AutomationRunner:
@@ -65,15 +109,10 @@ class AutomationRunner:
         chrome_path = find_chrome()
         if chrome_path:
             logger.info("Using system Chrome found at: %s", chrome_path)
-            return Browser(headless=self.headless, executable_path=chrome_path)
+            return Browser(headless=self.headless, executable_path=chrome_path, keep_alive=True)
         
         logger.warning("System Chrome not found. Falling back to default Playwright browser.")
-        return Browser(headless=self.headless)
-    
-    def _create_tools(self):
-        """Create tools registry."""
-        from browser_use import Tools
-        return Tools()
+        return Browser(headless=self.headless, keep_alive=True)
     
     async def run_task(self, task_description: str, sensitive_data: Optional[dict] = None, browser=None) -> dict:
         """
@@ -91,93 +130,229 @@ class AutomationRunner:
         """
         # Import browser-use components
         try:
-            from browser_use import Agent, ChatGoogle
+            from browser_use import Agent
         except ImportError:
             raise ImportError(
                 "browser-use is not installed. Run: uv pip install browser-use"
             )
-        
-        # Initialize Gemini LLM using browser-use's ChatGoogle
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("GOOGLE_API_KEY environment variable is not set. Get one at https://aistudio.google.com/app/apikey")
-        
-        # Set environment variable for ChatGoogle
-        os.environ["GOOGLE_API_KEY"] = api_key
-        
-        # Initialize main LLM
-        llm = ChatGoogle(model=self.llm_model)
-        
-        # Use gemini-flash-lite for page extraction (faster, cheaper)
-        page_extraction_llm = ChatGoogle(model="gemini-flash-lite-latest")
-        
-        # Initialize browser (reuse if provided)
-        if browser is None:
-            browser = self._create_browser()
-        
-        # Create tools
-        tools = self._create_tools()
-        
-        enhanced_task = task_description
-        
-        # If sensitive_data provided, add instructions for using the credentials
+
+        # Build credential instructions once (appended to every subtask)
+        credential_suffix = ""
         if sensitive_data:
-            credential_instructions = "\n\nIMPORTANT: User has provided the following credentials to use:\n"
+            credential_suffix = "\n\nIMPORTANT: User has provided the following credentials to use:\n"
             for key in sensitive_data.keys():
-                credential_instructions += f"- {key}: Use the value referenced as <secret>{key}</secret>\n"
-            credential_instructions += "\nUse these values when filling in the corresponding form fields."
-            enhanced_task = enhanced_task + credential_instructions
-        
-        # Create and run agent with token optimization settings
-        agent = Agent(
-            task=enhanced_task,
-            llm=llm,
-            flash_mode=True,
-            browser=browser,
-            tools=tools,
-            # Pass sensitive data for secure credential handling
-            sensitive_data=sensitive_data,
-            # Disable vision mode - use DOM-based navigation
-            use_vision=False,
-            # Use smaller model for page extraction
-            page_extraction_llm=page_extraction_llm,
-            # Limit actions per step to reduce context accumulation
-            max_actions_per_step=3,
-            # Limit retries to avoid excessive API calls
-            max_failures=2,
-        )
-        
+                credential_suffix += f"- {key}: Use the value referenced as <secret>{key}</secret>\n"
+            credential_suffix += "\nUse these values when filling in the corresponding form fields."
+
+        # Split into subtasks
+        subtasks = split_task(task_description)
+        logger.info("Starting automation task: %s...", task_description[:100])
+        logger.info("  Headless=%s  Model=%s  Sensitive=%s  Subtasks=%d",
+                    self.headless, self.llm_model,
+                    f"Yes - {len(sensitive_data)} values" if sensitive_data else "No",
+                    len(subtasks))
+
+        # Build initial LLMs
+        llm, main_key, page_extraction_llm, ext_key = build_llms()
+
+        # Track results across all subtasks
+        all_results: list[dict] = []
+        overall_success = True
+
+        current_browser = None
+
         try:
-            logger.info("Starting automation task: %s...", task_description[:100])
-            logger.info("  Headless=%s  Model=%s  Sensitive=%s",
-                        self.headless, self.llm_model,
-                        f"Yes - {len(sensitive_data)} values" if sensitive_data else "No")
+            # Single browser for the entire task — tabs persist across subtasks
+            current_browser = self._create_browser()
 
-            history = await agent.run()
+            for i, subtask in enumerate(subtasks, 1):
+                subtask_label = subtask[:80] + ("..." if len(subtask) > 80 else "")
+                logger.info("━━ Subtask %d/%d: %s", i, len(subtasks), subtask_label)
 
-            logger.info("Agent execution finished")
-            if hasattr(history, 'all_results'):
-                logger.info("  %d actions performed", len(history.all_results()))
+                enhanced_subtask = subtask + credential_suffix
 
-            # NOTE: Browser stays open after automation - user can close manually
-            logger.debug("Browser window kept open for review")
+                # Build agent kwargs
+                agent_kwargs = dict(
+                    task=enhanced_subtask,
+                    llm=llm,
+                    flash_mode=True,
+                    browser=current_browser,
+                    sensitive_data=sensitive_data,
+                    use_vision=False,
+                    max_actions_per_step=3,
+                    max_failures=1,
+                    retry_delay=2,
+                )
+                if page_extraction_llm is not None:
+                    agent_kwargs["page_extraction_llm"] = page_extraction_llm
+
+                agent = Agent(**agent_kwargs)
+
+                # Prevent Agent.close() from stopping the shared BrowserSession's EventBus
+                # This ensures the next subtask can reuse the exact same tab and CDP connection
+                async def noop_close(): pass
+                agent.close = noop_close
+
+                try:
+                    history = await agent.run()
+
+                    # -- 1. Inspect history for silent failures --
+                    is_failed = False
+                    is_rate_limited = False
+                    error_text = ""
+
+                    if hasattr(history, "is_successful"):
+                        success_val = history.is_successful() if callable(history.is_successful) else history.is_successful
+                        if not success_val:
+                            is_failed = True
+
+                    if hasattr(history, "errors"):
+                        errs = history.errors() if callable(history.errors) else history.errors
+                        if errs:
+                            error_text += str(errs).lower()
+                            if any(marker in error_text for marker in _RATE_LIMIT_MARKERS):
+                                is_failed = True
+                                is_rate_limited = True
+
+                    if hasattr(history, "history"):
+                        for step in history.history:
+                            if hasattr(step, "error") and step.error:
+                                err_str = str(step.error).lower()
+                                error_text += err_str
+                                if any(marker in err_str for marker in _RATE_LIMIT_MARKERS):
+                                    is_failed = True
+                                    is_rate_limited = True
+
+                    if hasattr(history, "final_result"):
+                        res = history.final_result() if callable(history.final_result) else history.final_result
+                        if res is None:
+                            is_failed = True
+
+                    # -- 2. Handle silent failure --
+                    if is_failed:
+                        if is_rate_limited:
+                            # Throwing this to reuse our existing rate-limit retry block below
+                            raise RuntimeError(f"Rate limit detected in history: {error_text}")
+                        else:
+                            # Non-429 failure: couldn't complete task but we shouldn't retry APIs
+                            logger.error("  ✗ Subtask %d failed (non-429 error). Counting as completed.", i)
+                            all_results.append({
+                                "subtask": subtask,
+                                "success": False,
+                                "error": "Agent failed task (non-API error)",
+                                "history": history,
+                            })
+                            continue
+
+                    logger.info("  ✓ Subtask %d completed", i)
+                    all_results.append({
+                        "subtask": subtask,
+                        "success": True,
+                        "history": history,
+                    })
+
+                except Exception as e:
+                    if _is_rate_limit_error(e):
+                        # ── Rate-limit retry: rotate key and try once more ──
+                        logger.warning("  ⚠ Subtask %d hit rate limit, rotating key...", i)
+                        key_manager.mark_key_exhausted(main_key, "gemini")
+                        if ext_key:
+                            key_manager.mark_key_exhausted(ext_key, "gemini")
+
+                        try:
+                            llm, main_key, page_extraction_llm, ext_key = build_llms()
+                        except RuntimeError:
+                            logger.error("  ✗ All Gemini API keys exhausted. Aborting remaining subtasks.")
+                            all_results.append({
+                                "subtask": subtask,
+                                "success": False,
+                                "error": "All Gemini API keys exhausted",
+                            })
+                            overall_success = False
+                            break
+
+                        # Reuse same browser (keep_alive=True keeps it alive)
+                        # Only swap the LLM keys
+                        agent_kwargs["llm"] = llm
+                        agent_kwargs["browser"] = current_browser
+                        if page_extraction_llm:
+                            agent_kwargs["page_extraction_llm"] = page_extraction_llm
+                        agent = Agent(**agent_kwargs)
+
+                        async def noop_close_retry(): pass
+                        agent.close = noop_close_retry
+
+                        try:
+                            history = await agent.run()
+                            
+                            # Inspect retry history as well
+                            is_failed_retry = False
+                            error_text_retry = ""
+                            if hasattr(history, "is_successful"):
+                                s_val = history.is_successful() if callable(history.is_successful) else history.is_successful
+                                if not s_val:
+                                    is_failed_retry = True
+                            if hasattr(history, "errors"):
+                                errs = history.errors() if callable(history.errors) else history.errors
+                                if errs:
+                                    error_text_retry += str(errs).lower()
+                            if hasattr(history, "history"):
+                                for step in history.history:
+                                    if hasattr(step, "error") and step.error:
+                                        error_text_retry += str(step.error).lower()
+                                        
+                            if is_failed_retry:
+                                if any(marker in error_text_retry for marker in _RATE_LIMIT_MARKERS):
+                                    raise RuntimeError(f"Retry also hit rate limit: {error_text_retry}")
+                                else:
+                                    raise RuntimeError("Agent failed on retry (non-API error)")
+
+                            logger.info("  ✓ Subtask %d completed on retry", i)
+                            all_results.append({
+                                "subtask": subtask,
+                                "success": True,
+                                "history": history,
+                            })
+                        except Exception as retry_err:
+                            logger.error("  ✗ Subtask %d failed on retry: %s", i, retry_err)
+                            all_results.append({
+                                "subtask": subtask,
+                                "success": False,
+                                "error": str(retry_err),
+                            })
+                            overall_success = False
+                            # Continue to next subtask
+
+                    else:
+                        # ── Non-API failure: log and continue ──
+                        logger.error("  ✗ Subtask %d failed: %s", i, e)
+                        all_results.append({
+                            "subtask": subtask,
+                            "success": False,
+                            "error": str(e),
+                        })
+                        overall_success = False
+                        # Continue to next subtask
+
+            logger.info("Agent execution finished — %d/%d subtasks succeeded",
+                        sum(1 for r in all_results if r["success"]), len(subtasks))
 
             return {
-                "success": True,
-                "history": history,
+                "success": overall_success,
+                "history": all_results,
                 "task": task_description,
+                "subtasks_total": len(subtasks),
+                "subtasks_passed": sum(1 for r in all_results if r["success"]),
             }
-        except Exception as e:
-            logger.error("Automation failed: %s", e, exc_info=True)
 
-            # NOTE: Browser stays open after error for debugging
-            logger.debug("Browser window kept open for debugging")
-
-            return {
-                "success": False,
-                "error": str(e),
-                "task": task_description,
-            }
+        except Exception:
+            # Only close browser on unexpected crash, not on normal completion
+            if current_browser:
+                try:
+                    await current_browser.close()
+                except Exception:
+                    pass
+            raise
     
     def run_task_sync(self, task_description: str) -> dict:
         """Synchronous wrapper for run_task."""
@@ -193,4 +368,3 @@ async def run_automation(
         headless=headless,
     )
     return await runner.run_task(task_description)
-

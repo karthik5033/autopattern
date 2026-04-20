@@ -3,7 +3,7 @@ name = "autopattern"
 version = "0.2.4"
 description = "Record and automate browser workflows with AI. Chat-based CLI + API server powered by Gemini and browser-use."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = {text = "MIT"}
 authors = [
     {name = "Ganesh"},
@@ -28,6 +28,7 @@ dependencies = [
     "browser-use>=0.11.0,<0.12.0",
     "langchain-core>=0.3.0",
     "langchain-google-genai>=2.0.0",
+    "langchain-openai>=0.1.0",
     "google-generativeai>=0.8.0",
     "playwright>=1.48.0",
     "requests>=2.31.0",

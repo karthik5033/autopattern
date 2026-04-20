@@ -93,7 +93,7 @@ class AutomateResponse(BaseModel):
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str = "ok"
-    version: str = "0.2.2"
+    version: str = "0.2.4"
     active_tasks: int = 0
     draining: bool = False
 
@@ -139,7 +139,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AutoPattern API",
     description="Browser automation powered by AI",
-    version="0.2.2",
+    version="0.2.4",
     lifespan=lifespan,
 )
 
@@ -171,9 +171,9 @@ async def health_check():
 AVAILABLE_MODELS = [
     "gemini-flash-latest",
     "gemini-pro-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.0-flash",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
 ]
 
 # Runtime settings (can be modified via API)
@@ -419,6 +419,9 @@ def run_server(host: str = "0.0.0.0", port: int = 5001):
         server.should_exit = True
 
     signal.signal(signal.SIGINT, _shutdown_handler)
-    signal.signal(signal.SIGTERM, _shutdown_handler)
+    # SIGTERM is not available on Windows
+    import sys
+    if sys.platform != "win32":
+        signal.signal(signal.SIGTERM, _shutdown_handler)
 
     server.run()

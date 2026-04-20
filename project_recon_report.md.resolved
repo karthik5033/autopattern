@@ -1,0 +1,264 @@
+# AutoPattern — Project Recon Report
+
+---
+
+## 1. Project Name & Purpose
+
+**AutoPattern** — Record browser workflows via a Chrome extension, then replay them automatically using AI (Google Gemini + browser-use). "Record once, replay forever."
+
+---
+
+## 2. File/Folder Structure
+
+```
+autopattern/
+├── .agent/                          # AI agent workflow templates (Gemini Code Assist)
+│   ├── workflows/                   # add-feature.md, fix-bug.md, release.md, etc.
+│   ├── AGENTS.md
+│   └── README.md
+│
+├── backend/                         # Python backend (FastAPI + browser-use)
+│   ├── automation/
+│   │   ├── .env                     # Runtime secrets (GOOGLE_API_KEY)
+│   │   ├── .env.example             # Template
+│   │   ├── __init__.py              # Package init, exports version
+│   │   ├── config.py                # Dataclass config, loads .env
+│   │   ├── main.py                  # CLI entry point (argparse)
+│   │   ├── chat.py                  # Interactive REPL + background API server
+│   │   ├── server.py                # FastAPI app, REST endpoints
+│   │   ├── automation_runner.py     # browser-use Agent execution
+│   │   ├── llm_client.py            # Gemini LLM calls (langchain)
+│   │   ├── task_manager.py          # Singleton task registry + concurrency lock
+│   │   └── workflow_loader.py       # CSV parser for exported workflows
+│   ├── __init__.py
+│   ├── pyproject.toml               # Package metadata, dependencies
+│   ├── uv.lock
+│   ├── gemini_models.txt            # Reference list of available Gemini models
+│   └── README.md
+│
+├── extension/                       # Chrome Extension (Manifest V3)
+│   ├── manifest.json                # Extension config
+│   ├── lib/
+│   │   ├── lucide.min.js            # Icon library
+│   │   └── mermaid.min.js           # Flowchart rendering
+│   ├── logic/
+│   │   └── intentRules.js           # EMPTY FILE — placeholder
+│   ├── src/
+│   │   ├── background/
+│   │   │   └── background.js        # Service worker: recording state, IndexedDB, AI describe
+│   │   ├── content/
+│   │   │   └── content.js           # Content script: click/input/scroll/nav listeners
+│   │   ├── ui/
+│   │   │   ├── popup.html + .js     # Extension popup (start/stop recording)
+│   │   │   ├── dashboard.html + .js # Full dashboard (workflow list, editor, chat, run)
+│   │   │   └── settings.js          # Settings panel (model selection, backend status)
+│   │   └── utils/
+│   │       ├── noiseReduction.js    # Event deduplication/filtering
+│   │       └── csvExporter.js       # ENTIRELY COMMENTED OUT — dead code
+│   └── README.md
+│
+├── installer/                       # Standalone pip-installable bootstrapper
+│   ├── src/autopattern_install/
+│   │   ├── __init__.py
+│   │   └── __main__.py              # Installs uv, then `uv tool install autopattern`
+│   ├── pyproject.toml
+│   └── README.md
+│
+├── website/                         # Next.js 16 landing page
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── layout.tsx           # Root layout, metadata
+│   │   │   ├── page.tsx             # Home page (assembles all sections)
+│   │   │   └── globals.css          # Global styles, animations, glassmorphism
+│   │   └── components/
+│   │       ├── Navbar.tsx
+│   │       ├── Hero.tsx
+│   │       ├── Features.tsx
+│   │       ├── HowItWorks.tsx
+│   │       ├── Demo.tsx
+│   │       ├── CTA.tsx
+│   │       └── Footer.tsx
+│   ├── package.json
+│   ├── next.config.ts
+│   ├── tsconfig.json
+│   └── postcss.config.mjs
+│
+├── .env.local                       # User's root-level env (fallback for GOOGLE_API_KEY)
+├── README.md                        # Main project README
+├── LICENSE                          # MIT
+├── package.json                     # Root-level (empty/minimal)
+└── pyrightconfig.json               # Python type checking config
+```
+
+---
+
+## 3. Tech Stack
+
+### Backend
+| Layer | Technology | Version |
+|---|---|---|
+| Language | Python | 3.14.2 (constraint relaxed to `>=3.11,<3.15`) |
+| Framework | FastAPI | latest (via pip) |
+| Server | Uvicorn | latest |
+| Browser Automation | browser-use | 0.11.13 |
+| Browser Engine | Playwright (Chromium) | 1.58.0 |
+| LLM Provider | Google Gemini (via `langchain-google-genai`) | 4.2.2 |
+| LLM Orchestration | LangChain Core | 1.3.0 |
+| CLI UI | Rich | 15.0 |
+| Package Manager | uv / pip | — |
+
+### Chrome Extension
+| Layer | Technology |
+|---|---|
+| Manifest | Chrome MV3 |
+| Storage | IndexedDB (via `AutomationDB`) |
+| Flowcharts | Mermaid.js (bundled) |
+| Icons | Lucide (bundled) |
+| HTTP | Native `fetch()` to localhost backend |
+
+### Website
+| Layer | Technology | Version |
+|---|---|---|
+| Framework | Next.js | 16.1.4 |
+| UI | React | 19.2.3 |
+| Styling | Tailwind CSS | v4 |
+| Language | TypeScript | ^5 |
+
+---
+
+## 4. Entry Points
+
+| Component | How It Starts |
+|---|---|
+| **Backend (default)** | `python -m automation.main` → `main()` → `chat.start_chat()` — starts REPL + API server on port 5001 |
+| **Backend (server only)** | `python -m automation.main --server` → `server.run_server()` |
+| **Backend (single task)** | `python -m automation.main --task "Go to google.com"` → `main_async()` |
+| **Backend (CSV workflow)** | `python -m automation.main --workflow file.csv` → loads CSV → LLM → runner |
+| **Extension** | `manifest.json` → `background.js` (service worker) + `content.js` (injected into all pages) |
+| **Website** | `npm run dev` in `website/` → Next.js dev server (port 3000) |
+| **Installer** | `pip install autopattern-install && autopattern-install` → installs uv → installs autopattern |
+
+---
+
+## 5. Core Features Currently Working
+
+| Feature | Status | Notes |
+|---|---|---|
+| Extension: Record clicks, inputs, scrolls, navigation | ✅ Working | Content script captures events, background.js stores in IndexedDB |
+| Extension: Popup start/stop recording | ✅ Working | |
+| Extension: Dashboard — view, search, delete workflows | ✅ Working | |
+| Extension: Dashboard — edit workflow steps | ✅ Working | Drag-and-drop reordering, inline editing |
+| Extension: Dashboard — Mermaid flowchart visualization | ✅ Working | |
+| Extension: Dashboard — Chat interface | ✅ Working | Type natural language tasks directly |
+| Extension: AI workflow description (via `/api/describe`) | ✅ Working | Calls backend to analyze events with Gemini |
+| Backend: FastAPI REST API | ✅ Working | `/api/health`, `/api/describe`, `/api/automate`, `/api/automate/task`, `/api/settings` |
+| Backend: Interactive chat REPL | ✅ Working | Rich-powered CLI with slash commands |
+| Backend: Browser automation via browser-use | ✅ Working | Gemini Flash + Playwright Chromium |
+| Backend: Task manager (single-task concurrency) | ✅ Working | Rejects concurrent tasks with 409 |
+| Backend: Sensitive data / credential injection | ✅ Working | `sensitive_data` dict passed to browser-use |
+| Backend: CSV workflow import | ✅ Working | Parses flattened dot-notation CSV |
+| Backend: Settings API (model selection, headless toggle) | ✅ Working | GET/PUT `/api/settings` |
+| Backend: Graceful shutdown (drain tasks) | ✅ Working | |
+| Website: Landing page | ✅ Working | Hero, Features, How It Works, Demo, CTA, Footer |
+| Installer: Zero-friction bootstrapper | ⚠️ Untested | Designed for PyPI distribution |
+| Extension: CSV export | ❌ Dead code | Entire `csvExporter.js` is commented out |
+| Extension: Intent rules | ❌ Empty | `intentRules.js` is 0 bytes |
+
+---
+
+## 6. Data Flow
+
+```
+User browses web
+    ↓
+content.js captures DOM events (click, input, scroll, navigation)
+    ↓ chrome.runtime.sendMessage
+background.js stores events in IndexedDB
+    ↓ User clicks "Stop Recording"
+background.js saves workflow → calls POST /api/describe
+    ↓
+FastAPI server → LLMClient (Gemini Pro) → returns {title, description, steps, required_inputs}
+    ↓
+background.js updates IndexedDB with AI analysis
+    ↓ User clicks "Run" on dashboard
+dashboard.js sends POST /api/automate with events + optional task_description + input_values
+    ↓
+server.py → task_manager.submit() → AutomationRunner.run_task()
+    ↓
+AutomationRunner creates Browser (Playwright Chromium) + Agent (browser-use + Gemini Flash)
+    ↓
+Agent executes task in real browser → returns result
+    ↓
+server.py returns {success, task_description, message, error} to extension
+```
+
+---
+
+## 7. Known Bugs, TODOs, and Incomplete Sections
+
+### Bugs (Fixed During This Session)
+- ~~`Browser()` called with wrong API (`BrowserConfig` doesn't exist in 0.11.13)~~ — Fixed
+- ~~`Tools` import from browser-use (doesn't exist)~~ — Fixed
+- ~~`signal.SIGTERM` crashes on Windows~~ — Fixed
+- ~~Version mismatch across files (0.2.2 vs 0.2.4)~~ — Fixed
+- ~~Hardcoded extension ID in website CTA links~~ — Fixed
+- ~~Python version constraint `<3.14` rejects user's 3.14.2~~ — Fixed
+
+### Remaining Issues
+1. **`csvExporter.js` is entirely commented out** — 179 lines of dead code. CSV export feature is non-functional.
+2. **`intentRules.js` is empty** — Placeholder for a planned intent classification system that was never built.
+3. **`AVAILABLE_MODELS` duplicated in 3 places** — `server.py`, `chat.py`, and `settings.js` each maintain their own model list. Single source of truth needed.
+4. **`llm_client.py` defaults `analysis_model` to `gemini-pro-latest`** — This model has extremely low free-tier limits (often 0 RPM). Should default to `gemini-flash-latest` or `gemini-2.0-flash` instead.
+5. **No retry logic on 429/503 API errors** — `llm_client.py` catches exceptions but returns a fallback string instead of retrying after the `retryDelay` Google provides.
+6. **Pydantic V1 deprecation warning on Python 3.14** — `langchain-core` still imports `pydantic.v1` shims, producing a noisy warning on every startup.
+7. **`automation_runner.py` never closes the browser** — After task completion/failure, the browser window stays open. No cleanup in `finally` block.
+8. **`chat.py` line 219: `global _headless` in `_cmd_model`** — Dead code; `_headless` is never used in that function (copy-paste from `_cmd_headless`).
+9. **Dashboard "AUTOMATIONS RUN" counter is hardcoded to 0** — `stat-automations` is always `'0'` (line 107 of `dashboard.js`).
+10. **Installer pins Python 3.13** — But the backend now supports `>=3.11,<3.15`. The installer should be more flexible.
+11. **`package-lock.json` in `backend/`** — Appears to be a stray Node.js artifact in a Python project.
+
+---
+
+## 8. External Dependencies
+
+| Dependency | Type | What It Does |
+|---|---|---|
+| **Google Gemini API** | REST API (via `langchain-google-genai` + `google-genai`) | Powers all LLM calls — workflow analysis, task description, agent reasoning |
+| **Playwright CDN** | Binary download | Downloads Chromium for Testing (~250MB) on first run |
+| **IndexedDB** (browser-local) | Client-side DB | Extension stores all workflow recordings locally in the browser |
+| **No external database** | — | No Postgres, Redis, SQLite, or any server-side persistence |
+| **No authentication** | — | API server is wide open on `0.0.0.0:5001` with `allow_origins=["*"]` |
+
+---
+
+## 9. Config Files
+
+| File | Location | Controls |
+|---|---|---|
+| `backend/automation/.env` | Backend | `GOOGLE_API_KEY` (required), `LLM_MODEL` (default: `gemini-flash-latest`), `HEADLESS` (default: `false`) |
+| `.env.local` | Project root | Fallback for `GOOGLE_API_KEY` (loaded by `config.py` with `override=False`) |
+| `backend/automation/.env.example` | Backend | Template showing required variables |
+| `backend/pyproject.toml` | Backend | Python version, dependencies, CLI entry point (`autopattern = automation.main:main`) |
+| `extension/manifest.json` | Extension | Permissions, content scripts, service worker, web-accessible resources |
+| `website/next.config.ts` | Website | Next.js config (minimal) |
+| `website/postcss.config.mjs` | Website | PostCSS + Tailwind v4 plugin |
+| `website/tsconfig.json` | Website | TypeScript config |
+| `pyrightconfig.json` | Root | Pyright type checker settings |
+
+---
+
+## 10. Weakest / Messiest Part of the Codebase
+
+**`llm_client.py` + the LLM integration layer.**
+
+This is the shakiest part of the entire system for several compounding reasons:
+
+1. **No resilience.** When Gemini returns 429 (quota) or 503 (overloaded), the code catches the exception and returns a degraded fallback string like `"Recorded workflow (AI analysis failed)"`. It never retries, even though Google's error response literally includes a `retryDelay` field. This means any momentary rate limit silently degrades the user experience.
+
+2. **Model selection is fragile.** The analysis model defaults to `gemini-pro-latest`, which on the free tier often has a quota of **zero** requests per minute. A user who just installed the app will immediately hit this wall on their first workflow recording (as you just experienced). It should default to `gemini-flash-latest`.
+
+3. **Two separate LLM clients for the same API.** `llm_client.py` uses `langchain-google-genai` (`ChatGoogleGenerativeAI`), while `automation_runner.py` uses browser-use's own `ChatGoogle` (which wraps `google-genai`). These are two different Python SDKs talking to the same API with different auth flows, different error handling, and different model name formats. This split makes debugging and rate-limit management harder.
+
+4. **The AVAILABLE_MODELS list is copy-pasted in 3 files** (`server.py`, `chat.py`, `settings.js`) with no single source of truth. When Google adds or deprecates models, all three must be updated manually.
+
+**Runner-up:** The extension's `dashboard.js` at 1174 lines is a monolithic script with no modularity — UI rendering, API calls, IndexedDB queries, Mermaid rendering, drag-and-drop, chat logic, and modal management all live in one flat file.

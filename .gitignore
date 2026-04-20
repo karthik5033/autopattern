@@ -1,6 +1,7 @@
 # Environment files
 .env
 *.env.local
+.key_state.json
 
 # Python
 __pycache__/

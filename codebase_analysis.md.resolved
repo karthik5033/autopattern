@@ -1,0 +1,113 @@
+# AutoPattern — Codebase Analysis & Issues
+
+## 📋 Project Overview
+
+AutoPattern is a **browser workflow automation tool** with 3 components:
+1. **Chrome Extension** — records user browser actions (clicks, inputs, scrolls, navigation)
+2. **Python/FastAPI Backend** — converts recorded events into AI tasks using Gemini, then executes them via `browser-use` + Playwright
+3. **Next.js Website** — marketing/landing page
+
+---
+
+## 🔑 Environment File Needed
+
+The `.env` file goes at `backend/automation/.env`. You need **one value**:
+
+| Variable | Required | Description |
+|---|---|---|
+| `GOOGLE_API_KEY` | **Yes** | Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey) |
+| `LLM_MODEL` | No | Default: `gemini-flash-latest` |
+| `HEADLESS` | No | Default: `false` (shows browser window) |
+| `ENABLE_HUMAN_IN_LOOP` | No | Default: `false` |
+
+---
+
+## 🐛 Issues Found
+
+### 1. **`automation_runner.py` — Invalid `Tools` import** (CRITICAL)
+`browser-use` does NOT export a `Tools` class. The code imports `Tools` and passes it to `Agent`, which will crash at runtime.
+
+```python
+# Line 75-76 — BROKEN
+from browser_use import Tools
+return Tools()
+
+# Line 94 — BROKEN
+from browser_use import Agent, ChatGoogle
+
+# Line 119
+tools = self._create_tools()
+```
+
+**Fix:** Remove the `Tools` import and `_create_tools()` method. The `Agent` class does not take a `tools` parameter in this form.
+
+### 2. **`automation_runner.py` — `executable_path` is not a `Browser()` parameter** (CRITICAL)
+`browser-use`'s `Browser` class uses `BrowserConfig` for configuration. Passing `executable_path` directly to `Browser()` will error.
+
+```python
+# Line 68 — BROKEN
+return Browser(headless=self.headless, executable_path=chrome_path)
+```
+
+**Fix:** Use `BrowserConfig`:
+```python
+from browser_use import Browser, BrowserConfig
+config = BrowserConfig(headless=self.headless, chrome_instance_path=chrome_path)
+return Browser(config=config)
+```
+
+### 3. **`automation_runner.py` — `Browser(headless=...)` wrong API** (CRITICAL)
+Same issue — `Browser()` takes a `BrowserConfig`, not raw kwargs.
+
+```python
+# Line 71
+return Browser(headless=self.headless)
+
+# chat.py Line 201
+browser = Browser(headless=_headless)
+```
+
+### 4. **`automation_runner.py` — `flash_mode` is not a valid `Agent` parameter**
+The `Agent` class does not have a `flash_mode` kwarg in browser-use 0.11.x.
+
+```python
+# Line 135 — INVALID
+flash_mode=True,
+```
+
+### 5. **`server.py` — SIGTERM handler on Windows** (CRASH on Windows)
+`signal.SIGTERM` does not exist on Windows. This will crash the server on your OS.
+
+```python
+# Line 422 — CRASHES ON WINDOWS
+signal.signal(signal.SIGTERM, _shutdown_handler)
+```
+
+### 6. **Version mismatch across files**
+- `backend/__init__.py` → `0.2.2`
+- `backend/automation/chat.py` → `0.2.4`
+- `backend/pyproject.toml` → `0.2.4`
+- `server.py` HealthResponse → `0.2.2`
+
+### 7. **`$null` junk file in backend directory**
+A 40-byte `$null` file exists in `backend/` — artifact of a PowerShell redirect bug. Harmless but should be deleted.
+
+### 8. **Website `next.config.ts` — may have issues**
+Minimal config, needs checking for Tailwind v4 compatibility.
+
+### 9. **Stale model list in code vs. actual Gemini models**
+The `AVAILABLE_MODELS` list includes `gemini-1.5-flash` and `gemini-1.5-pro` which are older. The `gemini_models.txt` shows the actual available models include `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.0-flash`, etc.
+
+---
+
+## 🔧 Fixes to Apply
+
+| # | File | Fix | Severity |
+|---|---|---|---|
+| 1 | `automation_runner.py` | Remove `Tools` import/usage, fix `Browser` to use `BrowserConfig` | 🔴 Critical |
+| 2 | `automation_runner.py` | Remove `flash_mode` and `tools` from `Agent()` kwargs | 🔴 Critical |
+| 3 | `chat.py` | Fix `Browser(headless=...)` to use `BrowserConfig` | 🔴 Critical |
+| 4 | `server.py` | Guard `SIGTERM` handler with platform check for Windows | 🟡 Medium |
+| 5 | `backend/__init__.py` + `server.py` | Sync version to `0.2.4` | 🟢 Low |
+| 6 | `server.py` + `chat.py` | Update `AVAILABLE_MODELS` to current Gemini models | 🟢 Low |
+| 7 | `backend/$null` | Delete junk file | 🟢 Low |

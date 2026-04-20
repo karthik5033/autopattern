@@ -14,6 +14,11 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
+# Also check project root .env.local as a fallback (won't override existing vars)
+_root_env_local = Path(__file__).parent.parent.parent / ".env.local"
+if _root_env_local.exists():
+    load_dotenv(dotenv_path=_root_env_local, override=False)
+
 
 @dataclass
 class Config:

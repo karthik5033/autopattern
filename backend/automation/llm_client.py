@@ -1,16 +1,31 @@
 """
 LLM Client module.
 Uses Google Gemini to convert workflow events into natural language task descriptions.
+
+Supports key rotation via KeyManager — automatically retries once with a
+fresh key if the current key hits a 429 / quota error.
 """
 
 import os
 import json
+import logging
 from typing import Optional
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .config import config
+from .key_manager import key_manager
 from .workflow_loader import Workflow
+
+logger = logging.getLogger("autopattern.llm_client")
+
+# Rate-limit error substrings (case-insensitive)
+_RATE_LIMIT_MARKERS = ("429", "quota", "exhausted", "rate", "resource_exhausted")
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    return any(m in msg for m in _RATE_LIMIT_MARKERS)
 
 
 SYSTEM_PROMPT = """You are a task description generator. Given a sequence of user actions recorded from a browser session, generate a clear, concise natural language description of what the user was trying to accomplish.
@@ -83,7 +98,11 @@ Output ONLY the JSON object, no markdown code blocks, no explanations."""
 
 
 class LLMClient:
-    """Client for generating task descriptions using Gemini."""
+    """Client for generating task descriptions using Gemini.
+
+    Uses :class:`KeyManager` for key selection so that 429 errors
+    trigger automatic rotation to the next available key.
+    """
     
     def __init__(
         self,
@@ -91,17 +110,37 @@ class LLMClient:
         analysis_model: Optional[str] = None,
     ):
         self.model = model or config.llm_model
-        self.analysis_model = analysis_model or "gemini-pro-latest"
-        
-        # Initialize Gemini
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("GOOGLE_API_KEY is required. Get one at https://aistudio.google.com/app/apikey")
-        
-        self.llm = ChatGoogleGenerativeAI(model=self.model, google_api_key=api_key)
-        
-        # Initialize a separate client for workflow step generation (uses the analysis model)
-        self.llm_pro = ChatGoogleGenerativeAI(model=self.analysis_model, google_api_key=api_key)
+        self.analysis_model = analysis_model or "gemini-flash-latest"
+
+        # Build the main LLM (for task-description generation)
+        self._key, self._provider = self._pick_gemini_key()
+        self.llm = ChatGoogleGenerativeAI(
+            model=self.model, google_api_key=self._key
+        )
+
+        # Build the analysis LLM (for workflow-step generation)
+        self._analysis_key, _ = self._pick_gemini_key()
+        self.llm_pro = ChatGoogleGenerativeAI(
+            model=self.analysis_model, google_api_key=self._analysis_key
+        )
+
+    @staticmethod
+    def _pick_gemini_key() -> tuple[str, str]:
+        """Get a Gemini key from key_manager, falling back to env var."""
+        try:
+            api_key, provider = key_manager.get_best_key(
+                preferred_provider="gemini"
+            )
+            return api_key, provider
+        except RuntimeError:
+            # Fallback to bare env var
+            api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+            if not api_key:
+                raise ValueError(
+                    "No Gemini API keys available. Add GOOGLE_API_KEY_1 "
+                    "through GOOGLE_API_KEY_10 to .env.local"
+                )
+            return api_key, "gemini"
     
     def generate_task_description(self, workflow: Workflow) -> str:
         """Generate a natural language task description from a workflow."""
@@ -132,23 +171,38 @@ Generate a task description for an AI browser agent to replicate this workflow."
         return self._generate(user_prompt)
 
     def _generate(self, prompt: str) -> str:
-        """Internal generation logic using Gemini."""
-        
+        """Internal generation logic using Gemini, with single-retry on 429."""
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+
         try:
-            response = self.llm.invoke([
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=prompt)
-            ])
-            content = response.content
-            if isinstance(content, list):
-                content = " ".join([str(c) for c in content])
-            return str(content).strip()
+            return self._invoke_and_extract(self.llm, messages)
         except Exception as e:
-            # If generation fails, return a safe fallback
-            print(f"Gemini generation failed: {e}")
-            print(f"Falling back to raw workflow summary")
-            # Extract a simple description from the prompt
+            if _is_rate_limit_error(e):
+                logger.warning("Task-description LLM hit rate limit, rotating key...")
+                key_manager.mark_key_exhausted(self._key, self._provider)
+                try:
+                    self._key, self._provider = self._pick_gemini_key()
+                    self.llm = ChatGoogleGenerativeAI(
+                        model=self.model, google_api_key=self._key
+                    )
+                    return self._invoke_and_extract(self.llm, messages)
+                except Exception as retry_err:
+                    logger.error("Retry also failed: %s", retry_err)
+
+            logger.error("Gemini generation failed: %s", e)
             return f"Perform the task based on: {prompt[:200]}..."
+
+    @staticmethod
+    def _invoke_and_extract(llm, messages: list) -> str:
+        """Call *llm* and return the text content."""
+        response = llm.invoke(messages)
+        content = response.content
+        if isinstance(content, list):
+            content = " ".join([str(c) for c in content])
+        return str(content).strip()
 
     def generate_workflow_steps(self, events: list[dict], start_url: str = "") -> dict:
         """
@@ -261,17 +315,23 @@ IMPORTANT:
 
 Generate a structured workflow plan optimized for browser automation."""
 
-        try:
-            response = self.llm_pro.invoke([
-                SystemMessage(content=WORKFLOW_STEPS_PROMPT),
-                HumanMessage(content=user_prompt)
-            ])
-            content = response.content
-            if isinstance(content, list):
-                content = " ".join([str(c) for c in content])
-            
-            # Parse the JSON response
-            content = str(content).strip()
+        messages = [
+            SystemMessage(content=WORKFLOW_STEPS_PROMPT),
+            HumanMessage(content=user_prompt),
+        ]
+
+        fallback = {
+            "title": "Workflow",
+            "description": "Recorded workflow (AI analysis failed)",
+            "steps": [{"id": i+1, "label": line} for i, line in enumerate(events_summary[:10])],
+            "required_inputs": self._generate_fallback_inputs(input_fields_detected),
+        }
+
+        def _parse_response(raw_content) -> dict:
+            """Parse and validate JSON from LLM response."""
+            if isinstance(raw_content, list):
+                raw_content = " ".join([str(c) for c in raw_content])
+            content = str(raw_content).strip()
             if content.startswith("```json"):
                 content = content[7:]
             if content.startswith("```"):
@@ -279,9 +339,9 @@ Generate a structured workflow plan optimized for browser automation."""
             if content.endswith("```"):
                 content = content[:-3]
             content = content.strip()
-            
+
             result = json.loads(content)
-            
+
             # Validate structure
             if "title" not in result:
                 result["title"] = "Workflow"
@@ -291,37 +351,45 @@ Generate a structured workflow plan optimized for browser automation."""
                 result["steps"] = []
             if "required_inputs" not in result:
                 result["required_inputs"] = []
-            
-            # Ensure step IDs are sequential
-            for i, step in enumerate(result["steps"], 1):
-                step["id"] = i
+
+            for i_step, step in enumerate(result["steps"], 1):
+                step["id"] = i_step
                 if "label" not in step:
-                    step["label"] = f"Step {i}"
-            
-            # Fallback: If no required_inputs detected but we found input fields, add them
+                    step["label"] = f"Step {i_step}"
+
             if not result["required_inputs"] and input_fields_detected:
                 result["required_inputs"] = self._generate_fallback_inputs(input_fields_detected)
-            
+
             return result
-            
+
+        # ── First attempt ──
+        try:
+            response = self.llm_pro.invoke(messages)
+            return _parse_response(response.content)
+
         except json.JSONDecodeError as e:
-            print(f"Failed to parse workflow steps JSON: {e}")
-            print(f"Raw response: {content}")
-            # Return a fallback structure with detected inputs
-            return {
-                "title": "Workflow",
-                "description": "Recorded workflow (AI analysis failed)",
-                "steps": [{"id": i+1, "label": line} for i, line in enumerate(events_summary[:10])],
-                "required_inputs": self._generate_fallback_inputs(input_fields_detected)
-            }
+            logger.error("Failed to parse workflow steps JSON: %s", e)
+            return fallback
+
         except Exception as e:
-            print(f"Workflow steps generation failed: {e}")
-            return {
-                "title": "Workflow",
-                "description": "Recorded workflow (AI analysis failed)",
-                "steps": [{"id": i+1, "label": line} for i, line in enumerate(events_summary[:10])],
-                "required_inputs": self._generate_fallback_inputs(input_fields_detected)
-            }
+            if _is_rate_limit_error(e):
+                # ── Retry with rotated key ──
+                logger.warning("Analysis LLM hit rate limit, rotating key...")
+                key_manager.mark_key_exhausted(self._analysis_key, "gemini")
+                try:
+                    self._analysis_key, _ = self._pick_gemini_key()
+                    self.llm_pro = ChatGoogleGenerativeAI(
+                        model=self.analysis_model,
+                        google_api_key=self._analysis_key,
+                    )
+                    response = self.llm_pro.invoke(messages)
+                    return _parse_response(response.content)
+                except Exception as retry_err:
+                    logger.error("Retry also failed: %s", retry_err)
+                    return fallback
+
+            logger.error("Workflow steps generation failed: %s", e)
+            return fallback
     
     def _generate_fallback_inputs(self, input_fields: list[dict]) -> list[dict]:
         """Generate required_inputs from detected input fields as fallback."""

@@ -31,11 +31,11 @@ export function Hero() {
 
                 {/* CTA Buttons */}
                 <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
-                    <a
-                        href="chrome-extension://oigefdjfcokhefifcockgnpjfgefomdd/src/ui/dashboard.html"
-                        className="group relative px-8 py-4 rounded-full bg-gradient-to-r from-purple-600 to-cyan-600 font-semibold text-lg hover:scale-105 transition-all pulse-glow"
+                    <button
+                        onClick={() => alert('Please install/load the AutoPattern extension in Chrome (chrome://extensions) to access the dashboard. If installed, click the extension icon.')}
+                        className="group relative px-8 py-4 rounded-full bg-gradient-to-r from-purple-600 to-cyan-600 font-semibold text-lg hover:scale-105 transition-all pulse-glow cursor-pointer border-none"
                     >
-                        <span className="relative z-10 flex items-center gap-2">
+                        <span className="relative z-10 flex items-center gap-2 text-white">
                             Open Dashboard
                             <svg
                                 className="w-5 h-5 group-hover:translate-x-1 transition-transform"
@@ -51,7 +51,7 @@ export function Hero() {
                                 />
                             </svg>
                         </span>
-                    </a>
+                    </button>
                     <a
                         href="#demo"
                         className="px-8 py-4 rounded-full border border-white/20 font-semibold text-lg hover:bg-white/10 transition-all flex items-center gap-2"
