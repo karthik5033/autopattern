@@ -26,7 +26,7 @@ from dotenv import dotenv_values
 # Constants
 # ---------------------------------------------------------------------------
 
-_MAX_KEYS = 10
+_MAX_KEYS = 12
 _COOLDOWN_SECONDS = 60
 
 # Path to .env.local at project root (backend/automation/../../.env.local)
@@ -41,8 +41,8 @@ _KEY_STATE_PATH = Path(__file__).parent / ".key_state.json"
 class KeyManager:
     """Round-robin API key manager with per-key cooldown tracking.
 
-    Loads ``GROQ_API_KEY_1`` … ``GROQ_API_KEY_10`` and
-    ``GOOGLE_API_KEY_1`` … ``GOOGLE_API_KEY_10`` from the project-root
+    Loads ``GROQ_API_KEY_1`` … ``GROQ_API_KEY_12`` and
+    ``GOOGLE_API_KEY_1`` … ``GOOGLE_API_KEY_12`` from the project-root
     ``.env.local`` file.  Keys that are missing or empty are silently
     skipped.
 

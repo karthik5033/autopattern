@@ -34,23 +34,21 @@ def _is_rate_limit_error(error: Exception) -> bool:
 
 def build_llms():
     """Build the main Agent LLM and the page extraction LLM using different Gemini keys."""
-    from browser_use import ChatGoogle
+    from langchain_google_genai import ChatGoogleGenerativeAI
     
     # 1. Main LLM
     main_key = key_manager.get_next_gemini_key()
     if not main_key:
         raise RuntimeError("All Gemini API keys are exhausted or cooling down.")
 
-    os.environ["GOOGLE_API_KEY"] = main_key
-    llm = ChatGoogle(model="gemini-flash-latest")
-    logger.info("Built main LLM: Gemini (gemini-flash-latest)")
+    llm = ChatGoogleGenerativeAI(model=config.llm_model, google_api_key=main_key)
+    logger.info(f"Built main LLM: Gemini ({config.llm_model})")
 
     # 2. Extraction LLM
     ext_key = key_manager.get_next_gemini_key()
     if ext_key:
-        os.environ["GOOGLE_API_KEY"] = ext_key
-        page_extraction_llm = ChatGoogle(model="gemini-flash-lite-latest")
-        logger.info("Built extraction LLM: Gemini (gemini-flash-lite-latest)")
+        page_extraction_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-8b", google_api_key=ext_key)
+        logger.info("Built extraction LLM: Gemini (gemini-2.5-flash-8b)")
     else:
         page_extraction_llm = None
 
