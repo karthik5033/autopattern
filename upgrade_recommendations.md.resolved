@@ -1,0 +1,284 @@
+# AutoPattern — Architecture Upgrade Roadmap
+
+After a full audit of every file in `backend/automation/`, here are the concrete improvements ranked by impact. Each section includes **what's wrong now**, **what to build**, and **estimated effort**.
+
+---
+
+## 🔴 Priority 1 — Critical Fixes (Broken or Disconnected)
+
+### 1. The Multi-Agent Pipeline Is Not Wired Into the Main Loop
+
+**Problem:** Your `MultiAgentRunner` (orchestrator → browser agent → extraction agent) exists but is completely disconnected from the main `chat.py` REPL and `server.py` API. It's only accessible through the `--multi` CLI flag, and even there it creates a **brand-new `AutomationRunner` per subtask**, throwing away the shared browser session.
+
+```
+chat.py  →  AutomationRunner (works, uses task_splitter.py)
+server.py → AutomationRunner (works)
+cli.py    → MultiAgentRunner  (broken: creates new browser per subtask, no key rotation)
+```
+
+**Fix — Unify the pipelines:**
+
+| Component | Current | Proposed |
+|---|---|---|
+| `task_splitter.py` | Regex heuristics, no LLM | Keep as fast fallback |
+| `orchestrator.py` | Ollama qwen2.5, not used in main path | Integrate as optional LLM-based planner |
+| `multi_agent_runner.py` | Standalone, no key rotation, no shared browser | **Delete.** Merge orchestrator into `AutomationRunner` |
+| `extraction_agent.py` | Ollama phi3, never called from main path | Wire into post-subtask extraction in `AutomationRunner` |
+
+The end state should be a single `AutomationRunner.run_task()` that optionally:
+1. Uses Orchestrator for LLM-based planning (if `--multi` or complex task detected)
+2. Falls back to `task_splitter.py` regex when Ollama is unavailable
+3. Runs extraction agent after each subtask completes
+4. Stores everything in `AgentMemory`
+
+### 2. Subtask Context Is Lost Between Subtasks
+
+**Problem:** When the task is "search for yonex rackets on Amazon, then search for the same on Flipkart", the second subtask gets sent as `"in another tab search for the same in flipkart"` — the agent literally doesn't know what "the same" refers to because there's no context from subtask 1.
+
+**Fix — Inject prior subtask results as context:**
+
+```python
+# In the subtask loop, before creating the agent:
+if i > 1 and all_results:
+    prev = all_results[-1]
+    # Extract the final result text from the previous subtask
+    prev_summary = _extract_final_result(prev.get("history"))
+    enhanced_subtask = (
+        f"Previous step completed: {prev_summary}\n\n"
+        f"Now do: {subtask}"
+    )
+```
+
+This is a simple 10-line change with huge impact on multi-step task quality.
+
+---
+
+## 🟡 Priority 2 — Robustness & Reliability
+
+### 3. Add a Pre-Step Delay to Respect Rate Limits
+
+**Problem:** The Gemini free tier allows **5 requests/minute per key**. A typical 7-step task burns through a key in ~40 seconds, then hammers 429s for 20 seconds before the retry loop rotates. This wastes ~4 failed API calls per rotation.
+
+**Fix — Add intelligent pacing:**
+
+```python
+import time
+
+_MIN_STEP_INTERVAL = 12.5  # seconds → 5 req/min safe
+_last_call_time = 0.0
+
+# Before each agent step (or wrap the ChatGoogle call):
+async def _pace():
+    global _last_call_time
+    elapsed = time.monotonic() - _last_call_time
+    if elapsed < _MIN_STEP_INTERVAL:
+        await asyncio.sleep(_MIN_STEP_INTERVAL - elapsed)
+    _last_call_time = time.monotonic()
+```
+
+Alternatively, since `browser-use` controls the step loop internally, you could:
+- Set `retry_delay=15` in the Agent kwargs (currently `2`)
+- Or monkey-patch the `ChatGoogle` wrapper to add a pre-call sleep
+
+### 4. The Judge Trace Uses the Same (Exhausted) Key
+
+**Problem:** After the agent finishes successfully, `browser-use` runs a "Judge" LLM call to verify the result. This uses the **same LLM object**, which may already be rate-limited. You saw this in the Bitcoin task — the Judge threw a 429 even though the task succeeded.
+
+**Fix — Disable the judge for free-tier usage:**
+
+```python
+agent_kwargs = dict(
+    ...
+    validate_output=False,  # Disable the judge trace
+)
+```
+
+Or, provide a separate LLM for the judge (not currently exposed by browser-use 0.12.6, but possible by subclassing `Agent`).
+
+### 5. Clean Up Dead/Blocked API Keys
+
+**Problem:** Your `.env.local` has 12 Gemini keys, but several throw `403 PERMISSION_DENIED` immediately. Every task wastes time cycling through dead keys.
+
+**Fix — Add a `/keys` slash command and a startup key-health check:**
+
+```python
+# On startup or via /keys command:
+async def _validate_keys():
+    """Test each key with a minimal API call."""
+    for i, key in enumerate(key_manager.gemini_keys):
+        try:
+            # Tiny test request
+            ...
+            console.print(f"  Key {i+1}: [success]✓ OK[/success]")
+        except Exception as e:
+            if "403" in str(e):
+                console.print(f"  Key {i+1}: [error]✗ BLOCKED[/error]")
+                key_manager.mark_key_exhausted(key, "gemini")
+```
+
+---
+
+## 🟢 Priority 3 — Feature Upgrades
+
+### 6. Enable Vision Mode for Complex Pages
+
+**Problem:** `use_vision=False` means the agent works entirely from the DOM tree text. For visually complex pages (Coinbase, dashboards, captchas), the agent can't see what a human sees.
+
+**Fix:** Make vision configurable:
+
+```python
+# In chat.py, add /vision command
+# In automation_runner.py:
+agent_kwargs = dict(
+    ...
+    use_vision=config.use_vision,  # Default: False for speed, True for accuracy
+)
+```
+
+> [!TIP]
+> Vision mode costs ~10x more tokens per step but dramatically improves accuracy on visually complex sites. Consider enabling it selectively for retry attempts.
+
+### 7. Add Memory Persistence Across Sessions
+
+**Problem:** `AgentMemory` writes to `.agent_memory.json` but is never read back by the main pipeline. The memory system exists but provides no value.
+
+**Fix — Wire memory into the main loop:**
+
+```
+Task: "search for the same thing we did yesterday"
+→ Memory reads last session's goal/results
+→ Orchestrator gets context: "Yesterday you searched for 'yonex rackets'"
+→ Agent knows what to do
+```
+
+Implementation:
+1. Load memory at the start of `run_task()`
+2. After each subtask, call `memory.store_result()`
+3. In the task prompt, inject `memory.get_context()` as system context
+4. Add a `/memory` slash command to inspect/clear stored sessions
+
+### 8. Parallel Subtask Execution
+
+**Problem:** Subtasks like "search Amazon AND Flipkart" are independent but run sequentially. Each subtask takes 30-60 seconds.
+
+**Fix — Detect parallelizable subtasks and run them concurrently:**
+
+```python
+# In orchestrator.py, add a "depends_on" field:
+{
+    "index": 0, "action": "search Amazon for yonex rackets", "depends_on": []
+},
+{
+    "index": 1, "action": "search Flipkart for yonex rackets", "depends_on": []
+},
+{
+    "index": 2, "action": "compare prices from both", "depends_on": [0, 1]
+}
+
+# In runner: group by dependency level, run each level with asyncio.gather()
+```
+
+### 9. Structured Error Recovery
+
+**Problem:** When a subtask fails (non-API error), the runner just logs it and moves on. There's no attempt to retry with a different approach.
+
+**Fix — Add a recovery strategy:**
+
+```python
+if is_failed and not is_rate_limited:
+    # Strategy 1: Retry with vision enabled
+    if not agent_kwargs.get("use_vision"):
+        logger.info("  🔄 Retrying subtask %d with vision...", i)
+        agent_kwargs["use_vision"] = True
+        continue  # retry in while loop
+
+    # Strategy 2: Retry with simplified task
+    simplified = f"Navigate directly to the URL and {subtask}"
+    agent_kwargs["task"] = simplified
+    continue
+```
+
+### 10. Add a `/status` Dashboard Command
+
+**Fix — Rich-formatted live dashboard:**
+
+```
+> /status
+╭─────────────────────────────────────╮
+│  🔑 API Keys                        │
+│  Gemini: 8/12 available (4 cooling) │
+│  Groq:   10/10 available            │
+│                                      │
+│  📊 Session Stats                    │
+│  Tasks run:     7                    │
+│  Success rate:  85.7%                │
+│  Avg steps:     4.2                  │
+│                                      │
+│  🧠 Memory                           │
+│  Last goal: "search yonex rackets"  │
+│  Stored results: 3                   │
+╰─────────────────────────────────────╯
+```
+
+---
+
+## 📐 Architecture Diagram — Current vs Proposed
+
+```mermaid
+graph TB
+    subgraph "Current (Disconnected)"
+        A[chat.py REPL] --> B[AutomationRunner]
+        B --> C[task_splitter.py<br/>regex only]
+        B --> D[browser-use Agent]
+        
+        E[cli.py --multi] --> F[MultiAgentRunner]
+        F --> G[Orchestrator<br/>Ollama qwen2.5]
+        F --> H[ExtractionAgent<br/>Ollama phi3]
+        F --> I[AutomationRunner<br/>new instance per subtask]
+        
+        J[AgentMemory] -.->|"writes but<br/>never read"| K[.agent_memory.json]
+    end
+```
+
+```mermaid
+graph TB
+    subgraph "Proposed (Unified)"
+        A[chat.py REPL] --> B[AutomationRunner]
+        A2[server.py API] --> B
+        
+        B --> C{Planning Strategy}
+        C -->|"Ollama available"| D[Orchestrator<br/>LLM planning]
+        C -->|"Ollama unavailable"| E[task_splitter.py<br/>regex fallback]
+        
+        D --> F[Subtask Loop]
+        E --> F
+        
+        F --> G[browser-use Agent<br/>shared browser session]
+        F --> H[ExtractionAgent<br/>post-step extraction]
+        F --> I[AgentMemory<br/>context injection]
+        
+        I --> F
+        
+        G --> J[Key Rotation<br/>with pacing]
+    end
+```
+
+---
+
+## Implementation Priority Order
+
+| # | Task | Effort | Impact |
+|---|------|--------|--------|
+| 1 | Inject previous subtask context | 30 min | 🔥🔥🔥 |
+| 2 | Disable judge trace (`validate_output=False`) | 5 min | 🔥🔥 |
+| 3 | Increase `retry_delay` to 13s | 1 min | 🔥🔥 |
+| 4 | Add `/status` command | 1 hr | 🔥 |
+| 5 | Startup key health check | 1 hr | 🔥🔥 |
+| 6 | Unify MultiAgentRunner into AutomationRunner | 3 hrs | 🔥🔥🔥 |
+| 7 | Wire AgentMemory into main pipeline | 2 hrs | 🔥🔥 |
+| 8 | Configurable vision mode | 1 hr | 🔥🔥 |
+| 9 | Parallel subtask execution | 4 hrs | 🔥 |
+| 10 | Structured error recovery | 2 hrs | 🔥🔥 |
+
+> [!IMPORTANT]
+> Items 1-3 can be done **right now** in under 40 minutes and will immediately eliminate the majority of failures you've been seeing. Want me to implement them?

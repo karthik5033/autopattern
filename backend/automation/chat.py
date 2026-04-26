@@ -470,6 +470,25 @@ async def start_chat(port: int = 5001):
 
     _print_banner(port)
 
+    # --- Run one-time key health check to blacklist dead keys ---
+    from .key_manager import key_manager
+    console.print("  [muted]Checking API key health...[/muted]", end="")
+    try:
+        health = key_manager.startup_health_check()
+        if health["blocked"] > 0:
+            console.print(
+                f"\r  🔑 Key health: [success]{health['available']}/{health['total']} available[/success]"
+                f", [warning]{health['blocked']} blocked[/warning]"
+            )
+        else:
+            console.print(
+                f"\r  🔑 Key health: [success]{health['available']}/{health['total']} available[/success]"
+                "                   "  # overwrite the "Checking..." text
+            )
+    except Exception as e:
+        console.print(f"\r  [warning]⚠ Key health check failed: {e}[/warning]")
+    console.print()
+
     # --- Register shared task-manager callbacks so the CLI shows API tasks ---
     from .task_manager import task_manager, TaskSource, TaskStatus
 

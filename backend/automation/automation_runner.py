@@ -3,23 +3,37 @@ Automation Runner module.
 Uses browser-use to execute tasks based on LLM-generated descriptions.
 
 Supports multi-key rotation via KeyManager and subtask splitting via
-TaskSplitter. Automatically falls back between Groq and Gemini when
-a provider hits rate limits.
+TaskSplitter. When Ollama is available, uses the Orchestrator for
+LLM-based planning and the ExtractionAgent for structured output.
+Falls back to regex-based splitting when Ollama is unavailable.
 """
 
 import asyncio
 import logging
 import os
+import re
 from typing import Optional
+
+import httpx
 
 from .config import config
 from .key_manager import key_manager
 from .task_splitter import split_task
+from .memory import AgentMemory
 
 logger = logging.getLogger("autopattern.runner")
 
-# Rate-limit error substrings (case-insensitive matching)
-_RATE_LIMIT_MARKERS = ("429", "quota", "exhausted", "rate", "resource_exhausted", "503", "unavailable")
+# Silence noisy background connection warnings from browser-use on shutdown
+logging.getLogger("BrowserSession").setLevel(logging.ERROR)
+
+# Rate-limit and access error substrings (case-insensitive matching)
+_RATE_LIMIT_MARKERS = ("429", "quota", "exhausted", "rate", "resource_exhausted", "503", "unavailable", "403", "permission_denied")
+
+# Patterns that indicate a "complex" task (needs LLM planning)
+_COMPLEX_TASK_PATTERN = re.compile(
+    r"\b(and\s+then|then\s+|after\s+that|finally\s|next\s|compare|extract|find\s+.*\s+and)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_rate_limit_error(error: Exception) -> bool:
@@ -28,37 +42,76 @@ def _is_rate_limit_error(error: Exception) -> bool:
     return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
 
 
+def _extract_final_result(history_obj) -> str:
+    """Extract the final result text from a browser-use history object.
+
+    Returns a human-readable summary string, or an empty string if
+    no result can be extracted.
+    """
+    if history_obj is None:
+        return ""
+    # history_obj may be an AgentHistoryList from browser-use
+    if hasattr(history_obj, "final_result"):
+        res = history_obj.final_result() if callable(history_obj.final_result) else history_obj.final_result
+        if res:
+            return str(res)
+    # Fallback: check the list stored in our all_results dicts
+    if isinstance(history_obj, dict):
+        h = history_obj.get("history")
+        if h:
+            return _extract_final_result(h)
+    return ""
+
+
+def _is_complex_task(task: str) -> bool:
+    """Return True if the task is complex enough to benefit from LLM planning."""
+    word_count = len(task.split())
+    if word_count > 8:
+        return True
+    if _COMPLEX_TASK_PATTERN.search(task):
+        return True
+    return False
+
+
+def _is_ollama_available() -> bool:
+    """Check if Ollama is running by pinging its API."""
+    try:
+        resp = httpx.get("http://localhost:11434/api/tags", timeout=2.0)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # LLM builder — picks Groq or Gemini based on KeyManager availability
 # ---------------------------------------------------------------------------
 
 def build_llms():
     """Build the main Agent LLM and the page extraction LLM using different Gemini keys."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    from pydantic import ConfigDict
-    
-    class PatchedChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
-        model_config = ConfigDict(extra='allow')
-        provider: str = 'google'
-        
-        @property
-        def model_name(self):
-            return self.model
-    
+    from browser_use.llm.google.chat import ChatGoogle
+
     # 1. Main LLM
     main_key = key_manager.get_next_gemini_key()
     if not main_key:
         raise RuntimeError("All Gemini API keys are exhausted or cooling down.")
 
     main_model = config.llm_model if config.llm_model != "gemini-flash-latest" else "gemini-2.5-flash"
-    llm = PatchedChatGoogleGenerativeAI(model=main_model, google_api_key=main_key)
-    logger.info(f"Built main LLM: Gemini ({main_model})")
+    
+    # Use browser-use native ChatGoogle wrapper to completely avoid Langchain items parsing bug
+    llm = ChatGoogle(
+        model=main_model,
+        api_key=main_key,
+    )
+    logger.info(f"Built main LLM: ChatGoogle ({main_model})")
 
     # 2. Extraction LLM
     ext_key = key_manager.get_next_gemini_key()
     if ext_key:
-        page_extraction_llm = PatchedChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", google_api_key=ext_key)
-        logger.info("Built extraction LLM: Gemini (gemini-2.5-flash-lite)")
+        page_extraction_llm = ChatGoogle(
+            model="gemini-2.5-flash-lite", 
+            api_key=ext_key,
+        )
+        logger.info("Built extraction LLM: ChatGoogle (gemini-2.5-flash-lite)")
     else:
         page_extraction_llm = None
 
@@ -66,7 +119,12 @@ def build_llms():
 
 
 class AutomationRunner:
-    """Runs browser automation using browser-use library."""
+    """Runs browser automation using browser-use library.
+    
+    Unified pipeline that supports both:
+    - LLM-based planning via Ollama (Orchestrator + ExtractionAgent)
+    - Regex-based splitting via TaskSplitter (fallback)
+    """
     
     def __init__(
         self,
@@ -152,13 +210,62 @@ class AutomationRunner:
                 credential_suffix += f"- {key}: Use the value referenced as <secret>{key}</secret>\n"
             credential_suffix += "\nUse these values when filling in the corresponding form fields."
 
-        # Split into subtasks
-        subtasks = split_task(task_description)
+        # ── Decide planning strategy: Ollama LLM vs regex ──
+        use_ollama = False
+        orchestrator = None
+        extraction_agent = None
+
+        if _is_ollama_available() and _is_complex_task(task_description):
+            try:
+                from .orchestrator import Orchestrator
+                from .extraction_agent import ExtractionAgent
+                orchestrator = Orchestrator()
+                extraction_agent = ExtractionAgent()
+                use_ollama = True
+                logger.info("Planning mode: Ollama LLM (Orchestrator + ExtractionAgent)")
+            except Exception as e:
+                logger.warning("Ollama modules failed to load (%s), falling back to regex splitter", e)
+        else:
+            if not _is_ollama_available():
+                logger.info("Planning mode: regex splitter (Ollama not available)")
+            else:
+                logger.info("Planning mode: regex splitter (simple task detected)")
+
+        # ── Build subtask list ──
+        # Each item is a dict with: action, expected_output (LLM) or just action (regex)
+        subtask_list: list[dict] = []
+
+        if use_ollama:
+            raw_plan = orchestrator.plan(task_description)
+            for st in raw_plan:
+                subtask_list.append({
+                    "action": st.get("action", task_description),
+                    "expected_output": st.get("expected_output", ""),
+                    "index": st.get("index", len(subtask_list)),
+                })
+        else:
+            raw_subtasks = split_task(task_description)
+            for idx, st_text in enumerate(raw_subtasks):
+                subtask_list.append({
+                    "action": st_text,
+                    "expected_output": "",
+                    "index": idx,
+                })
+
+        # ── Initialize shared memory ──
+        memory = AgentMemory()
+        memory.clear()
+        memory.set_goal(task_description)
+
         logger.info("Starting automation task: %s...", task_description[:100])
-        logger.info("  Headless=%s  Model=%s  Sensitive=%s  Subtasks=%d",
+        logger.info("  Headless=%s  Model=%s  Sensitive=%s  Subtasks=%d  Ollama=%s",
                     self.headless, self.llm_model,
                     f"Yes - {len(sensitive_data)} values" if sensitive_data else "No",
-                    len(subtasks))
+                    len(subtask_list), use_ollama)
+
+        # Register subtasks in memory
+        for st in subtask_list:
+            memory.add_subtask(st["index"], st["action"], st["expected_output"])
 
         # Build initial LLMs
         llm, main_key, page_extraction_llm, ext_key = build_llms()
@@ -173,184 +280,214 @@ class AutomationRunner:
             # Single browser for the entire task — tabs persist across subtasks
             current_browser = self._create_browser()
 
-            for i, subtask in enumerate(subtasks, 1):
-                subtask_label = subtask[:80] + ("..." if len(subtask) > 80 else "")
-                logger.info("━━ Subtask %d/%d: %s", i, len(subtasks), subtask_label)
+            for i, subtask_info in enumerate(subtask_list):
+                subtask_action = subtask_info["action"]
+                subtask_expected = subtask_info["expected_output"]
+                subtask_index = subtask_info["index"]
+                subtask_num = i + 1  # 1-based for display
 
-                enhanced_subtask = subtask + credential_suffix
+                subtask_label = subtask_action[:80] + ("..." if len(subtask_action) > 80 else "")
+                logger.info("━━ Subtask %d/%d: %s", subtask_num, len(subtask_list), subtask_label)
 
-                # Build agent kwargs
+                # ── Inject context from memory (richer than simple previous result) ──
+                if i > 0:
+                    mem_context = memory.get_context()
+                    enhanced_subtask = (
+                        f"{mem_context}\n\n"
+                        f"Now do: {subtask_action}"
+                    ) + credential_suffix
+                else:
+                    enhanced_subtask = subtask_action + credential_suffix
+
+                # ── Vision retry tracking ──
+                vision_attempted = False
+
+                # Build agent kwargs base
                 agent_kwargs = dict(
                     task=enhanced_subtask,
-                    llm=llm,
                     flash_mode=True,
-                    browser=current_browser,
                     sensitive_data=sensitive_data,
                     use_vision=False,
+                    use_judge=False,
                     max_actions_per_step=3,
                     max_failures=3,
-                    retry_delay=2,
+                    retry_delay=13,
                 )
-                if page_extraction_llm is not None:
-                    agent_kwargs["page_extraction_llm"] = page_extraction_llm
 
-                agent = Agent(**agent_kwargs)
+                while True:
+                    agent_kwargs["llm"] = llm
+                    agent_kwargs["browser"] = current_browser
+                    if page_extraction_llm is not None:
+                        agent_kwargs["page_extraction_llm"] = page_extraction_llm
+                    elif "page_extraction_llm" in agent_kwargs:
+                        del agent_kwargs["page_extraction_llm"]
 
-                # Prevent Agent.close() from stopping the shared BrowserSession's EventBus
-                # This ensures the next subtask can reuse the exact same tab and CDP connection
-                async def noop_close(): pass
-                agent.close = noop_close
+                    agent = Agent(**agent_kwargs)
 
-                try:
-                    history = await agent.run()
+                    # Prevent Agent.close() from stopping the shared BrowserSession's EventBus
+                    # This ensures the next subtask can reuse the exact same tab and CDP connection
+                    async def noop_close(): pass
+                    agent.close = noop_close
 
-                    # -- 1. Inspect history for silent failures --
-                    is_failed = False
-                    is_rate_limited = False
-                    error_text = ""
+                    try:
+                        history = await agent.run()
 
-                    if hasattr(history, "is_successful"):
-                        success_val = history.is_successful() if callable(history.is_successful) else history.is_successful
-                        if not success_val:
-                            is_failed = True
+                        # -- 1. Inspect history for silent failures --
+                        is_failed = False
+                        is_rate_limited = False
+                        error_text = ""
 
-                    if hasattr(history, "errors"):
-                        errs = history.errors() if callable(history.errors) else history.errors
-                        if errs:
-                            error_text += str(errs).lower()
-                            if any(marker in error_text for marker in _RATE_LIMIT_MARKERS):
+                        if hasattr(history, "is_successful"):
+                            success_val = history.is_successful() if callable(history.is_successful) else history.is_successful
+                            if not success_val:
                                 is_failed = True
-                                is_rate_limited = True
 
-                    if hasattr(history, "history"):
-                        for step in history.history:
-                            if hasattr(step, "error") and step.error:
-                                err_str = str(step.error).lower()
-                                error_text += err_str
-                                if any(marker in err_str for marker in _RATE_LIMIT_MARKERS):
+                        if hasattr(history, "errors"):
+                            errs = history.errors() if callable(history.errors) else history.errors
+                            if errs:
+                                error_text += str(errs).lower()
+                                if any(marker in error_text for marker in _RATE_LIMIT_MARKERS):
                                     is_failed = True
                                     is_rate_limited = True
 
-                    if hasattr(history, "final_result"):
-                        res = history.final_result() if callable(history.final_result) else history.final_result
-                        if res is None:
-                            is_failed = True
+                        if hasattr(history, "history"):
+                            for step in history.history:
+                                if hasattr(step, "error") and step.error:
+                                    err_str = str(step.error).lower()
+                                    error_text += err_str
+                                    if any(marker in err_str for marker in _RATE_LIMIT_MARKERS):
+                                        is_failed = True
+                                        is_rate_limited = True
 
-                    # -- 2. Handle silent failure --
-                    if is_failed:
-                        if is_rate_limited:
-                            # Throwing this to reuse our existing rate-limit retry block below
-                            raise RuntimeError(f"Rate limit detected in history: {error_text}")
-                        else:
-                            # Non-429 failure: couldn't complete task but we shouldn't retry APIs
-                            logger.error("  ✗ Subtask %d failed (non-429 error). Counting as completed.", i)
-                            all_results.append({
-                                "subtask": subtask,
-                                "success": False,
-                                "error": "Agent failed task (non-API error)",
-                                "history": history,
-                            })
-                            continue
+                        if hasattr(history, "final_result"):
+                            res = history.final_result() if callable(history.final_result) else history.final_result
+                            if res is None:
+                                is_failed = True
 
-                    logger.info("  ✓ Subtask %d completed", i)
-                    all_results.append({
-                        "subtask": subtask,
-                        "success": True,
-                        "history": history,
-                    })
+                        # -- 2. Handle silent failure --
+                        if is_failed:
+                            if is_rate_limited:
+                                # Throwing this to reuse our existing rate-limit retry block below
+                                raise RuntimeError(f"Rate limit detected in history: {error_text}")
+                            else:
+                                # ── Vision retry: try once with vision enabled ──
+                                if not vision_attempted:
+                                    vision_attempted = True
+                                    agent_kwargs["use_vision"] = True
+                                    logger.info("  🔄 Subtask %d failed — retrying with vision enabled...", subtask_num)
+                                    continue  # Retry in while loop
 
-                except Exception as e:
-                    if _is_rate_limit_error(e):
-                        # ── Rate-limit retry: rotate key and try once more ──
-                        logger.warning("  ⚠ Subtask %d hit rate limit, rotating key...", i)
-                        key_manager.mark_key_exhausted(main_key, "gemini")
-                        if ext_key:
-                            key_manager.mark_key_exhausted(ext_key, "gemini")
+                                # Vision also failed — give up on this subtask
+                                logger.error("  ✗ Subtask %d failed (non-API error, vision retry exhausted).", subtask_num)
+                                raw_result = _extract_final_result(history)
+                                memory.store_result(subtask_index, raw_result, {}, False)
+                                all_results.append({
+                                    "subtask": subtask_action,
+                                    "success": False,
+                                    "error": "Agent failed task (non-API error)",
+                                    "history": history,
+                                })
+                                break  # Proceed to next subtask
 
-                        try:
-                            llm, main_key, page_extraction_llm, ext_key = build_llms()
-                        except RuntimeError:
-                            logger.error("  ✗ All Gemini API keys exhausted. Aborting remaining subtasks.")
-                            all_results.append({
-                                "subtask": subtask,
-                                "success": False,
-                                "error": "All Gemini API keys exhausted",
-                            })
-                            overall_success = False
-                            break
+                        # ── Success path ──
+                        raw_result = _extract_final_result(history)
 
-                        # Reuse same browser (keep_alive=True keeps it alive)
-                        # Only swap the LLM keys
-                        agent_kwargs["llm"] = llm
-                        agent_kwargs["browser"] = current_browser
-                        if page_extraction_llm:
-                            agent_kwargs["page_extraction_llm"] = page_extraction_llm
-                        agent = Agent(**agent_kwargs)
+                        # Run extraction agent if Ollama is available
+                        extracted_data = {}
+                        if use_ollama and extraction_agent and subtask_expected:
+                            try:
+                                extracted_data = extraction_agent.extract(raw_result, subtask_expected)
+                                logger.info("  📋 Extracted: %s", str(extracted_data)[:120])
+                            except Exception as ext_err:
+                                logger.warning("  ⚠ Extraction failed: %s", ext_err)
+                                extracted_data = {"raw": raw_result, "error": str(ext_err)}
 
-                        async def noop_close_retry(): pass
-                        agent.close = noop_close_retry
+                        # Store in memory
+                        memory.store_result(subtask_index, raw_result, extracted_data, True)
 
-                        try:
-                            history = await agent.run()
-                            
-                            # Inspect retry history as well
-                            is_failed_retry = False
-                            error_text_retry = ""
-                            if hasattr(history, "is_successful"):
-                                s_val = history.is_successful() if callable(history.is_successful) else history.is_successful
-                                if not s_val:
-                                    is_failed_retry = True
-                            if hasattr(history, "errors"):
-                                errs = history.errors() if callable(history.errors) else history.errors
-                                if errs:
-                                    error_text_retry += str(errs).lower()
-                            if hasattr(history, "history"):
-                                for step in history.history:
-                                    if hasattr(step, "error") and step.error:
-                                        error_text_retry += str(step.error).lower()
-                                        
-                            if is_failed_retry:
-                                if any(marker in error_text_retry for marker in _RATE_LIMIT_MARKERS):
-                                    raise RuntimeError(f"Retry also hit rate limit: {error_text_retry}")
-                                else:
-                                    raise RuntimeError("Agent failed on retry (non-API error)")
-
-                            logger.info("  ✓ Subtask %d completed on retry", i)
-                            all_results.append({
-                                "subtask": subtask,
-                                "success": True,
-                                "history": history,
-                            })
-                        except Exception as retry_err:
-                            logger.error("  ✗ Subtask %d failed on retry: %s", i, retry_err)
-                            all_results.append({
-                                "subtask": subtask,
-                                "success": False,
-                                "error": str(retry_err),
-                            })
-                            overall_success = False
-                            # Continue to next subtask
-
-                    else:
-                        # ── Non-API failure: log and continue ──
-                        logger.error("  ✗ Subtask %d failed: %s", i, e)
+                        logger.info("  ✓ Subtask %d completed", subtask_num)
                         all_results.append({
-                            "subtask": subtask,
-                            "success": False,
-                            "error": str(e),
+                            "subtask": subtask_action,
+                            "success": True,
+                            "history": history,
+                            "extracted_data": extracted_data,
                         })
-                        overall_success = False
-                        # Continue to next subtask
+                        break  # Break loop on success, proceed to next subtask
+
+                    except Exception as e:
+                        if _is_rate_limit_error(e):
+                            # ── Rate-limit retry: rotate key and try again ──
+                            logger.warning("  ⚠ Subtask %d hit rate limit/access denied, rotating key...", subtask_num)
+                            key_manager.mark_key_exhausted(main_key, "gemini")
+                            if ext_key:
+                                key_manager.mark_key_exhausted(ext_key, "gemini")
+
+                            try:
+                                llm, main_key, page_extraction_llm, ext_key = build_llms()
+                            except RuntimeError:
+                                logger.error("  ✗ All Gemini API keys exhausted. Aborting remaining subtasks.")
+                                memory.store_result(subtask_index, "", {}, False)
+                                all_results.append({
+                                    "subtask": subtask_action,
+                                    "success": False,
+                                    "error": "All Gemini API keys exhausted",
+                                })
+                                overall_success = False
+                                break  # Break from inner retry loop
+                                
+                        else:
+                            # ── Vision retry for non-API failures ──
+                            if not vision_attempted:
+                                vision_attempted = True
+                                agent_kwargs["use_vision"] = True
+                                logger.info("  🔄 Subtask %d exception — retrying with vision enabled...", subtask_num)
+                                continue  # Retry in while loop
+
+                            # ── Non-API failure after vision retry: log and continue ──
+                            logger.error("  ✗ Subtask %d failed: %s", subtask_num, e)
+                            memory.store_result(subtask_index, str(e), {}, False)
+                            all_results.append({
+                                "subtask": subtask_action,
+                                "success": False,
+                                "error": str(e),
+                            })
+                            overall_success = False
+                            break  # Proceed to next subtask
+
+                if not overall_success and len(all_results) > 0 and all_results[-1].get("error") == "All Gemini API keys exhausted":
+                    break  # Abort all remaining subtasks
 
             logger.info("Agent execution finished — %d/%d subtasks succeeded",
-                        sum(1 for r in all_results if r["success"]), len(subtasks))
+                        sum(1 for r in all_results if r["success"]), len(subtask_list))
+
+            # ── Generate final summary via Ollama if available ──
+            summary = ""
+            if use_ollama and orchestrator:
+                try:
+                    # Build a serializable results list for the summarizer
+                    serializable_results = []
+                    for r in memory.get_all_results():
+                        serializable_results.append({
+                            "index": r.get("index"),
+                            "success": r.get("success"),
+                            "extracted_data": r.get("extracted_data", {}),
+                            "raw_result": r.get("raw_result", "")[:200],
+                        })
+                    summary = orchestrator.summarize(task_description, serializable_results)
+                    memory.state["summary"] = summary
+                    memory.save()
+                    logger.info("📝 Summary: %s", summary[:200])
+                except Exception as sum_err:
+                    logger.warning("⚠ Summary generation failed: %s", sum_err)
 
             return {
                 "success": overall_success,
                 "history": all_results,
                 "task": task_description,
-                "subtasks_total": len(subtasks),
+                "subtasks_total": len(subtask_list),
                 "subtasks_passed": sum(1 for r in all_results if r["success"]),
+                "planning_mode": "ollama" if use_ollama else "regex",
+                "summary": summary,
             }
 
         except Exception:

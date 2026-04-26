@@ -288,6 +288,58 @@ class KeyManager:
             f"cooling={len(self._cooldowns)}>"
         )
 
+    # ------------------------------------------------------------------
+    # Startup health check
+    # ------------------------------------------------------------------
+
+    def startup_health_check(self) -> dict:
+        """Test each Gemini key with a minimal API call.
+
+        Keys that return 403 PERMISSION_DENIED or have a zero quota
+        are permanently marked exhausted for this session (cooldown set
+        to a very large value so they never recover).
+
+        Returns a summary dict:
+            {"total": 12, "available": 9, "blocked": 3, "details": [...]}
+        """
+        import google.genai as genai
+
+        total = len(self.gemini_keys)
+        blocked = 0
+        details: list[dict] = []
+
+        _PERMANENT_COOLDOWN = 999_999  # ~11.5 days — effectively permanent
+
+        for i, key in enumerate(self.gemini_keys):
+            key_label = f"Key {i + 1}"
+            masked = key[:6] + "..." + key[-4:]
+            try:
+                client = genai.Client(api_key=key)
+                client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents="hi",
+                )
+                details.append({"key": masked, "status": "ok"})
+            except Exception as e:
+                err_msg = str(e).lower()
+                if "403" in err_msg or "permission_denied" in err_msg or "limit:0" in err_msg:
+                    # Permanently block this key
+                    with self._lock:
+                        self._cooldowns[key] = time.monotonic() + _PERMANENT_COOLDOWN
+                    blocked += 1
+                    details.append({"key": masked, "status": "blocked"})
+                else:
+                    # Transient error (429 etc.) — key may still be usable later
+                    details.append({"key": masked, "status": f"warn: {str(e)[:60]}"})
+
+        available = total - blocked
+        return {
+            "total": total,
+            "available": available,
+            "blocked": blocked,
+            "details": details,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Module-level singleton — import this everywhere

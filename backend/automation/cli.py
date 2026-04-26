@@ -2,17 +2,17 @@ import json
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from .multi_agent_runner import MultiAgentRunner
+from .automation_runner import AutomationRunner
 from .memory import AgentMemory
 
 console = Console()
 
 def show_banner():
-    console.print(Panel.fit("[bold cyan]AutoPattern Multi-Agent v1.0[/bold cyan]\nOrchestrator: qwen2.5:7b | Browser: Gemini | Extractor: phi3", title="Welcome"))
+    console.print(Panel.fit("[bold cyan]AutoPattern Multi-Agent v2.0[/bold cyan]\nOrchestrator: qwen2.5:7b | Browser: Gemini | Extractor: phi3\nNow unified into AutomationRunner (Ollama auto-detected)", title="Welcome"))
 
 def start_multi_agent_cli():
     show_banner()
-    runner = MultiAgentRunner()
+    runner = AutomationRunner(headless=False)
     memory = AgentMemory()
 
     while True:
@@ -48,31 +48,31 @@ def start_multi_agent_cli():
                     console.print(table)
                 continue
 
-            console.print(f"[bold blue]Running multi-agent loop for goal:[/bold blue] {user_input}")
-            result = runner.run(user_input)
+            console.print(f"[bold blue]Running automation for goal:[/bold blue] {user_input}")
+            import asyncio
+            result = asyncio.run(runner.run_task(user_input))
 
             console.print("\n[bold magenta]Final Results[/bold magenta]")
             table = Table(title="Subtask Results")
-            table.add_column("Index", justify="right", style="cyan")
-            table.add_column("Action", style="blue")
+            table.add_column("#", justify="right", style="cyan")
+            table.add_column("Subtask", style="blue")
             table.add_column("Success", style="magenta")
             table.add_column("Extracted Data", style="green")
             
-            memory.load()
-            subtasks = {st.get("index"): st.get("description", "Unknown") for st in memory.state.get("subtasks", [])}
-            
-            for r in result["results"]:
-                idx = r.get("index")
-                action = subtasks.get(idx, "Unknown")
+            for idx, r in enumerate(result.get("history", [])):
+                subtask_name = r.get("subtask", "Unknown")[:60]
                 success_str = "✅" if r.get("success") else "❌"
-                data_str = json.dumps(r.get("extracted_data", {}), indent=2)
-                table.add_row(str(idx), action, success_str, data_str)
+                data_str = json.dumps(r.get("extracted_data", {}), indent=2) if r.get("extracted_data") else "-"
+                table.add_row(str(idx), subtask_name, success_str, data_str)
             console.print(table)
+
+            planning = result.get("planning_mode", "unknown")
+            console.print(f"\n  Planning mode: [cyan]{planning}[/cyan]")
+            console.print(f"  Subtasks: {result.get('subtasks_passed', 0)}/{result.get('subtasks_total', 0)} succeeded")
             
-            console.print("\n[bold magenta]Full JSON Result[/bold magenta]")
-            console.print_json(data=result)
-            
-            console.print(f"\n[bold magenta]Summary[/bold magenta]\n{result['summary']}")
+            summary = result.get("summary", "")
+            if summary:
+                console.print(f"\n[bold magenta]Summary[/bold magenta]\n{summary}")
 
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted by user.[/yellow]")
