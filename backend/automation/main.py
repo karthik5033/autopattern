@@ -54,6 +54,11 @@ def parse_args():
         action="store_true",
         help="Guided setup (installs Playwright browsers and configures API key)",
     )
+    group.add_argument(
+        "--multi",
+        action="store_true",
+        help="Run the new multi-agent CLI",
+    )
     
     parser.add_argument(
         "--port",
@@ -180,6 +185,12 @@ def main():
         # Handle setup mode
         if args.setup:
             run_setup()
+            sys.exit(0)
+
+        # Handle multi-agent mode
+        if args.multi:
+            from .cli import start_multi_agent_cli
+            start_multi_agent_cli()
             sys.exit(0)
 
         # Handle server-only mode

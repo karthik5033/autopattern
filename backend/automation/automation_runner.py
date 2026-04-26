@@ -35,20 +35,30 @@ def _is_rate_limit_error(error: Exception) -> bool:
 def build_llms():
     """Build the main Agent LLM and the page extraction LLM using different Gemini keys."""
     from langchain_google_genai import ChatGoogleGenerativeAI
+    from pydantic import ConfigDict
+    
+    class PatchedChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
+        model_config = ConfigDict(extra='allow')
+        provider: str = 'google'
+        
+        @property
+        def model_name(self):
+            return self.model
     
     # 1. Main LLM
     main_key = key_manager.get_next_gemini_key()
     if not main_key:
         raise RuntimeError("All Gemini API keys are exhausted or cooling down.")
 
-    llm = ChatGoogleGenerativeAI(model=config.llm_model, google_api_key=main_key)
-    logger.info(f"Built main LLM: Gemini ({config.llm_model})")
+    main_model = config.llm_model if config.llm_model != "gemini-flash-latest" else "gemini-2.5-flash"
+    llm = PatchedChatGoogleGenerativeAI(model=main_model, google_api_key=main_key)
+    logger.info(f"Built main LLM: Gemini ({main_model})")
 
     # 2. Extraction LLM
     ext_key = key_manager.get_next_gemini_key()
     if ext_key:
-        page_extraction_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-8b", google_api_key=ext_key)
-        logger.info("Built extraction LLM: Gemini (gemini-2.5-flash-8b)")
+        page_extraction_llm = PatchedChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", google_api_key=ext_key)
+        logger.info("Built extraction LLM: Gemini (gemini-2.5-flash-lite)")
     else:
         page_extraction_llm = None
 
@@ -178,7 +188,7 @@ class AutomationRunner:
                     sensitive_data=sensitive_data,
                     use_vision=False,
                     max_actions_per_step=3,
-                    max_failures=1,
+                    max_failures=3,
                     retry_delay=2,
                 )
                 if page_extraction_llm is not None:

@@ -38,6 +38,8 @@ dependencies = [
     "pydantic>=2.0.0",
     "websockets>=13.0",
     "rich>=13.0.0",
+    "ollama>=0.1.0",
+    "langchain-community>=0.0.10",
 ]
 
 [project.optional-dependencies]

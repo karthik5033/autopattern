@@ -158,8 +158,9 @@ class TaskManager:
                     raise
                 except Exception as e:
                     info.status = TaskStatus.FAILED
-                    info.result = {"success": False, "error": str(e)}
-                    raise
+                    result = {"success": False, "error": str(e)}
+                    info.result = result
+                    return result
                 finally:
                     info.finished_at = datetime.now()
                     self._fire(self._on_end, info)
