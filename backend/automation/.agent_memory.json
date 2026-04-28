@@ -1,35 +1,17 @@
 {
-  "goal": "go to google and search for top 5 programming languages 2025 and open the first result and extract the list of languages with their rankings",
+  "goal": "go to youtube and play a song",
   "subtasks": [
     {
       "index": 0,
-      "description": "Go to google.com",
-      "expected_output": "Google homepage loaded"
-    },
-    {
-      "index": 1,
-      "description": "Search for 'top 5 programming languages 2025'",
-      "expected_output": "Search results page loaded"
-    },
-    {
-      "index": 2,
-      "description": "Click on the first search result",
-      "expected_output": "Page of the clicked link is opened"
-    },
-    {
-      "index": 3,
-      "description": "Extract the list of programming languages with their rankings from the page",
-      "expected_output": "List of languages and their rankings"
+      "description": "go to youtube and play a song",
+      "expected_output": ""
     }
   ],
   "results": [
     {
       "index": 0,
-      "raw_result": "Successfully navigated to google.com.",
-      "extracted_data": {
-        "status": "success",
-        "message": "Google homepage loaded"
-      },
+      "raw_result": "Successfully navigated to YouTube and played the song 'Shararat | Dhurandhar | Ranveer, Aditya Dhar, Shashwat, Jasmine, Madhubanti, Ayesha, Krystle'.",
+      "extracted_data": {},
       "success": true
     }
   ],
