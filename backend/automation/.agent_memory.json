@@ -1,42 +1,37 @@
 {
-  "goal": "go to google and search for python tutorials and open the first result and extract the page title",
+  "goal": "go to google and search for top 5 programming languages 2025 and open the first result and extract the list of languages with their rankings",
   "subtasks": [
     {
       "index": 0,
-      "description": "Navigate to Google at https://www.google.com",
-      "expected_output": "URL is loaded and ready for search input"
+      "description": "Go to google.com",
+      "expected_output": "Google homepage loaded"
     },
     {
       "index": 1,
-      "description": "Enter the query 'python tutorials' in the search bar and press enter",
-      "expected_output": "Search results for 'python tutorials' are displayed"
+      "description": "Search for 'top 5 programming languages 2025'",
+      "expected_output": "Search results page loaded"
     },
     {
       "index": 2,
-      "description": "Click on the first result from the search",
-      "expected_output": "The link of the first result is opened in a new tab or within the current page"
+      "description": "Click on the first search result",
+      "expected_output": "Page of the clicked link is opened"
     },
     {
       "index": 3,
-      "description": "Extract and display the title of the webpage",
-      "expected_output": "Title of the webpage is captured and can be used further"
+      "description": "Extract the list of programming languages with their rankings from the page",
+      "expected_output": "List of languages and their rankings"
     }
   ],
   "results": [
     {
       "index": 0,
-      "raw_result": "Successfully navigated to https://www.google.com.",
+      "raw_result": "Successfully navigated to google.com.",
       "extracted_data": {
-        "URL": "https://www.google.com"
+        "status": "success",
+        "message": "Google homepage loaded"
       },
       "success": true
-    },
-    {
-      "index": 1,
-      "raw_result": "",
-      "extracted_data": {},
-      "success": false
     }
   ],
-  "summary": "The task aimed to navigate to Google, search for Python tutorials, open the first result, and extract its page title. The process began by successfully navigating to Google (https://www.google.com). However, searching for Python tutorials and opening the first result was not accomplished as indicated by the second entry in the results, which shows a failure with no additional details provided."
+  "summary": ""
 }

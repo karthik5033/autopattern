@@ -1,0 +1,57 @@
+	async def _handle_step_error(self, error: Exception) -> None:
+		"""Handle all types of errors that can occur during a step"""
+
+		# Handle InterruptedError specially
+		if isinstance(error, InterruptedError):
+			error_msg = 'The agent was interrupted mid-step' + (f' - {str(error)}' if str(error) else '')
+			# NOTE: This is not an error, it's a normal part of the execution when the user interrupts the agent
+			self.logger.warning(f'{error_msg}')
+			return
+
+		# Handle browser closed/disconnected errors
+		if self._is_connection_like_error(error):
+			# If reconnection is in progress, wait for it instead of stopping
+			if self.browser_session.is_reconnecting:
+				wait_timeout = self.browser_session.RECONNECT_WAIT_TIMEOUT
+				self.logger.warning(
+					f'🔄 Connection error during reconnection, waiting up to {wait_timeout}s for reconnect: {error}'
+				)
+				try:
+					await asyncio.wait_for(self.browser_session._reconnect_event.wait(), timeout=wait_timeout)
+				except TimeoutError:
+					pass
+
+				# Check if reconnection succeeded
+				if self.browser_session.is_cdp_connected:
+					self.logger.info('🔄 Reconnection succeeded, retrying step...')
+					self.state.last_result = [ActionResult(error=f'Connection lost and recovered: {error}')]
+					return
+
+			# Not reconnecting or reconnection failed — check if truly terminal
+			if self._is_browser_closed_error(error):
+				self.logger.warning(f'🛑 Browser closed or disconnected: {error}')
+				self.state.stopped = True
+				self._external_pause_event.set()
+				return
+
+		# Handle all other exceptions
+		include_trace = self.logger.isEnabledFor(logging.DEBUG)
+		error_msg = AgentError.format_error(error, include_trace=include_trace)
+		max_total_failures = self.settings.max_failures + int(self.settings.final_response_after_failure)
+		prefix = f'❌ Result failed {self.state.consecutive_failures + 1}/{max_total_failures} times: '
+		self.state.consecutive_failures += 1
+
+		# Use WARNING for partial failures, ERROR only when max failures reached
+		is_final_failure = self.state.consecutive_failures >= max_total_failures
+		log_level = logging.ERROR if is_final_failure else logging.WARNING
+
+		if 'Could not parse response' in error_msg or 'tool_use_failed' in error_msg:
+			# give model a hint how output should look like
+			self.logger.log(log_level, f'Model: {self.llm.model} failed')
+			self.logger.log(log_level, f'{prefix}{error_msg}')
+		else:
+			self.logger.log(log_level, f'{prefix}{error_msg}')
+
+		await self._demo_mode_log(f'Step error: {error_msg}', 'error', {'step': self.state.n_steps})
+		self.state.last_result = [ActionResult(error=error_msg)]
+		return None

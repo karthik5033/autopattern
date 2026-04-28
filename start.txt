@@ -1,0 +1,7 @@
+	@observe_debug(ignore_input=True, ignore_output=True, name='browser_session_start')
+	async def start(self) -> None:
+		"""Start the browser session."""
+		start_event = self.event_bus.dispatch(BrowserStartEvent())
+		await start_event
+		# Ensure any exceptions from the event handler are propagated
+		await start_event.event_result(raise_if_any=True, raise_if_none=False)
