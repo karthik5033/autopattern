@@ -470,24 +470,29 @@ async def start_chat(port: int = 5001):
 
     _print_banner(port)
 
-    # --- Run one-time key health check to blacklist dead keys ---
+    # --- Run one-time key health check in the background ---
     from .key_manager import key_manager
-    console.print("  [muted]Checking API key health...[/muted]", end="")
-    try:
-        health = key_manager.startup_health_check()
-        if health["blocked"] > 0:
-            console.print(
-                f"\r  🔑 Key health: [success]{health['available']}/{health['total']} available[/success]"
-                f", [warning]{health['blocked']} blocked[/warning]"
-            )
-        else:
-            console.print(
-                f"\r  🔑 Key health: [success]{health['available']}/{health['total']} available[/success]"
-                "                   "  # overwrite the "Checking..." text
-            )
-    except Exception as e:
-        console.print(f"\r  [warning]⚠ Key health check failed: {e}[/warning]")
-    console.print()
+    console.print("  [muted]Starting background API key health check...[/muted]")
+
+    async def _bg_health_check():
+        try:
+            health = await asyncio.to_thread(key_manager.startup_health_check)
+            if health["blocked"] > 0:
+                console.print(
+                    f"\n  [info]ℹ[/info] 🔑 Key health: [success]{health['available']}/{health['total']} available[/success]"
+                    f", [warning]{health['blocked']} blocked[/warning]"
+                )
+            else:
+                console.print(
+                    f"\n  [info]ℹ[/info] 🔑 Key health: [success]{health['available']}/{health['total']} available[/success]"
+                )
+            # Re-print prompt to cleanly restore input line if user was typing
+            console.print("  [prompt]>[/prompt] ", end="")
+        except Exception as e:
+            console.print(f"\n  [warning]⚠ Key health check failed: {e}[/warning]")
+            console.print("  [prompt]>[/prompt] ", end="")
+
+    asyncio.create_task(_bg_health_check())
 
     # --- Register shared task-manager callbacks so the CLI shows API tasks ---
     from .task_manager import task_manager, TaskSource, TaskStatus

@@ -303,6 +303,7 @@ class KeyManager:
             {"total": 12, "available": 9, "blocked": 3, "details": [...]}
         """
         import google.genai as genai
+        import concurrent.futures
 
         total = len(self.gemini_keys)
         blocked = 0
@@ -310,8 +311,8 @@ class KeyManager:
 
         _PERMANENT_COOLDOWN = 999_999  # ~11.5 days — effectively permanent
 
-        for i, key in enumerate(self.gemini_keys):
-            key_label = f"Key {i + 1}"
+        def _check_key(key_info):
+            i, key = key_info
             masked = key[:6] + "..." + key[-4:]
             try:
                 client = genai.Client(api_key=key)
@@ -319,18 +320,26 @@ class KeyManager:
                     model="gemini-2.0-flash-lite",
                     contents="hi",
                 )
-                details.append({"key": masked, "status": "ok"})
+                return i, {"key": masked, "status": "ok"}, None
             except Exception as e:
                 err_msg = str(e).lower()
                 if "403" in err_msg or "permission_denied" in err_msg or "limit:0" in err_msg:
-                    # Permanently block this key
-                    with self._lock:
-                        self._cooldowns[key] = time.monotonic() + _PERMANENT_COOLDOWN
-                    blocked += 1
-                    details.append({"key": masked, "status": "blocked"})
+                    return i, {"key": masked, "status": "blocked"}, key
                 else:
-                    # Transient error (429 etc.) — key may still be usable later
-                    details.append({"key": masked, "status": f"warn: {str(e)[:60]}"})
+                    return i, {"key": masked, "status": f"warn: {str(e)[:60]}"}, None
+
+        if total > 0:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(total, 20)) as executor:
+                results = list(executor.map(_check_key, enumerate(self.gemini_keys)))
+            
+            results.sort(key=lambda x: x[0])
+            
+            for _, detail, bad_key in results:
+                details.append(detail)
+                if bad_key:
+                    with self._lock:
+                        self._cooldowns[bad_key] = time.monotonic() + _PERMANENT_COOLDOWN
+                    blocked += 1
 
         available = total - blocked
         return {
